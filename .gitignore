@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# Build output
+build/
+
+# Vendored libraries (if not managed by a package manager)
+libs/

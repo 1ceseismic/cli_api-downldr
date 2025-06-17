@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C++ YouTube Format Tool (Wasm)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>YouTube Video Info Fetcher (Wasm)</h1>
+    <div class="container">
+        <label for="youtubeUrl">YouTube URL:</label>
+        <input type="text" id="youtubeUrl" placeholder="Enter YouTube video URL">
+        <button id="fetchBtn">Fetch Video Info</button>
+    </div>
+
+    <div id="status"></div>
+    <div id="videoInfo" class="hidden">
+        <h2 id="videoTitle"></h2>
+        <p><strong>Author:</strong> <span id="videoAuthor"></span></p>
+        <p><strong>Duration:</strong> <span id="videoDuration"></span> seconds</p>
+
+        <h3>Available Formats:</h3>
+        <div id="formatsContainer">
+            <h4>Muxed (Audio+Video)</h4>
+            <ul id="muxedFormatsList"></ul>
+            <h4>Adaptive (DASH - Video Only or Audio Only)</h4>
+            <ul id="adaptiveFormatsList"></ul>
+        </div>
+    </div>
+
+    <!-- Emscripten will generate yt_wasm_module.js -->
+    <!-- For local testing, ensure this path is correct relative to your HTML file
+         after CMake builds into (e.g.) build-wasm/yt_wasm_module.js -->
+    <script src="yt_wasm_module.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
