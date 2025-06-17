@@ -2,6 +2,8 @@
 #include <iostream>
 #include <fstream> // For debug file output
 #include <regex>
+#include <vector> // Required for std::vector
+#include <algorithm> // Required for std::sort and std::remove_if
 #include <nlohmann/json.hpp>
 #include <cpr/cpr.h>
 #include <cpr/util.h> // For cpr::util::urlDecode
@@ -397,6 +399,147 @@ bool YouTubeFetcher::downloadStream(const MediaStream& stream,
 
 
     return true;
+}
+
+std::vector<MediaStream> getAllStreams(const VideoDetails& details, bool adaptive_first) {
+    std::vector<MediaStream> all_streams;
+    if (adaptive_first) {
+        all_streams.insert(all_streams.end(), details.adaptiveFormats.begin(), details.adaptiveFormats.end());
+        all_streams.insert(all_streams.end(), details.formats.begin(), details.formats.end());
+    } else {
+        all_streams.insert(all_streams.end(), details.formats.begin(), details.formats.end());
+        all_streams.insert(all_streams.end(), details.adaptiveFormats.begin(), details.adaptiveFormats.end());
+    }
+    return all_streams;
+}
+
+std::vector<MediaStream> filterStreams(const std::vector<MediaStream>& streams, const FormatSelectionCriteria& criteria) {
+    std::vector<MediaStream> filtered_streams;
+    for (const auto& stream : streams) {
+        // Apply stream_type filter
+        switch (criteria.stream_type) {
+            case StreamTypePreference::VIDEO_ONLY:
+                if (!stream.isVideoOnly || stream.isAudioOnly) continue; // Must be video only, not muxed with audio
+                break;
+            case StreamTypePreference::AUDIO_ONLY:
+                if (!stream.isAudioOnly || stream.isVideoOnly) continue; // Must be audio only
+                break;
+            case StreamTypePreference::MUXED:
+                if (stream.isDash) continue; // Muxed streams are not DASH (adaptive)
+                break;
+            case StreamTypePreference::ANY:
+            default:
+                // No specific stream type preference, or ANY is selected.
+                // However, we need to consider prefer_adaptive_over_muxed.
+                // If prefer_adaptive_over_muxed is true, and the stream is muxed,
+                // we might skip it if adaptive streams are generally preferred.
+                // This specific flag is more about how getAllStreams initially orders them
+                // or how selectBestStream might make a final choice.
+                // For filtering, ANY means it passes this specific check.
+                break;
+        }
+
+        // Apply target_height filter
+        if (criteria.target_height.has_value()) {
+            if (!stream.height.has_value() || stream.height.value() != criteria.target_height.value()) {
+                continue;
+            }
+        }
+
+        // Apply target_fps filter
+        if (criteria.target_fps.has_value()) {
+            if (!stream.fps.has_value() || stream.fps.value() != criteria.target_fps.value()) {
+                continue;
+            }
+        }
+
+        // Apply preferred_codec_video filter
+        if (criteria.preferred_codec_video.has_value() && (stream.isVideoOnly || !stream.isAudioOnly)) { // Apply to video or muxed streams
+            if (stream.codecs.find(criteria.preferred_codec_video.value()) == std::string::npos) {
+                continue;
+            }
+        }
+
+        // Apply preferred_codec_audio filter
+        if (criteria.preferred_codec_audio.has_value() && (stream.isAudioOnly || !stream.isVideoOnly)) { // Apply to audio or muxed streams
+             // For muxed streams, codecs string includes both video and audio.
+             // For audio only, it's just audio.
+            if (stream.codecs.find(criteria.preferred_codec_audio.value()) == std::string::npos) {
+                continue;
+            }
+        }
+        filtered_streams.push_back(stream);
+    }
+    return filtered_streams;
+}
+
+std::optional<MediaStream> selectBestStream(const std::vector<MediaStream>& streams, QualityPreference preference) {
+    if (streams.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<MediaStream> sorted_streams = streams; // Make a mutable copy
+
+    switch (preference) {
+        case QualityPreference::BEST_RESOLUTION:
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                long area_a = a.width.value_or(0) * a.height.value_or(0);
+                long area_b = b.width.value_or(0) * b.height.value_or(0);
+                if (area_a != area_b) return area_a > area_b;
+                if (a.fps.value_or(0) != b.fps.value_or(0)) return a.fps.value_or(0) > b.fps.value_or(0);
+                return a.bitrate > b.bitrate; // Higher bitrate is better as a tie-breaker
+            });
+            break;
+        case QualityPreference::WORST_RESOLUTION:
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                long area_a = a.width.value_or(0) * a.height.value_or(0);
+                long area_b = b.width.value_or(0) * b.height.value_or(0);
+                if (area_a != area_b) return area_a < area_b;
+                if (a.fps.value_or(0) != b.fps.value_or(0)) return a.fps.value_or(0) < b.fps.value_or(0);
+                return a.bitrate < b.bitrate; // Lower bitrate is worse as a tie-breaker
+            });
+            break;
+        case QualityPreference::BEST_BITRATE:
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                return a.bitrate > b.bitrate;
+            });
+            break;
+        case QualityPreference::WORST_BITRATE:
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                return a.bitrate < b.bitrate;
+            });
+            break;
+        case QualityPreference::BEST_AUDIO_BITRATE:
+            // Filter for audio streams first, then sort
+            sorted_streams.erase(std::remove_if(sorted_streams.begin(), sorted_streams.end(),
+                                               [](const MediaStream& s){ return !s.isAudioOnly && s.isVideoOnly; }), /* also remove video-only if logic is for pure audio */
+                                 sorted_streams.end());
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                if (a.bitrate != b.bitrate) return a.bitrate > b.bitrate;
+                return a.audioSampleRate.value_or(0) > b.audioSampleRate.value_or(0);
+            });
+            break;
+        case QualityPreference::WORST_AUDIO_BITRATE:
+            // Filter for audio streams first, then sort
+             sorted_streams.erase(std::remove_if(sorted_streams.begin(), sorted_streams.end(),
+                                               [](const MediaStream& s){ return !s.isAudioOnly && s.isVideoOnly; }),
+                                 sorted_streams.end());
+            std::sort(sorted_streams.begin(), sorted_streams.end(), [](const MediaStream& a, const MediaStream& b) {
+                if (a.bitrate != b.bitrate) return a.bitrate < b.bitrate;
+                return a.audioSampleRate.value_or(0) < b.audioSampleRate.value_or(0);
+            });
+            break;
+        case QualityPreference::NONE:
+        default:
+            // No preference, return the first stream if any
+            if (!sorted_streams.empty()) return sorted_streams.front();
+            return std::nullopt;
+    }
+
+    if (!sorted_streams.empty()) {
+        return sorted_streams.front();
+    }
+    return std::nullopt;
 }
 
 } // namespace yt_core

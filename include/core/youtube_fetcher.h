@@ -31,6 +31,11 @@ private:
     void parseStreamFormats(const nlohmann::json& playerResponseJson, VideoDetails& details);
 };
 
+// Function declarations for stream filtering and selection
+std::vector<MediaStream> getAllStreams(const VideoDetails& details, bool adaptive_first = true);
+std::vector<MediaStream> filterStreams(const std::vector<MediaStream>& streams, const FormatSelectionCriteria& criteria);
+std::optional<MediaStream> selectBestStream(const std::vector<MediaStream>& streams, QualityPreference preference);
+
 } // namespace yt_core
 
 #endif // YOUTUBE_FETCHER_H

@@ -43,6 +43,26 @@ void free_c_string(char* str_ptr);
  */
 const char* get_stream_url_json(const char* video_url_c_str, int itag);
 
+/**
+ * @brief Fetches video information for a given YouTube URL, applies filtering criteria,
+ *        and returns the (potentially filtered) video info as a JSON string.
+ *
+ * The JSON string will have the following structure:
+ * On success: {"success": true, "data": { ...VideoDetails with filtered formats... }}
+ * On failure: {"success": false, "error": "Error message"}
+ *
+ * The filter_criteria_c_str is a comma-separated string of key:value pairs,
+ * e.g., "res:1080,type:video,vcodec:vp9".
+ * If filter_criteria_c_str is null or empty, no filtering is applied, and it behaves like get_video_info_json.
+ *
+ * The caller is responsible for freeing the returned string using free_c_string().
+ *
+ * @param video_url_c_str A C-string representing the YouTube video URL.
+ * @param filter_criteria_c_str A C-string representing the filtering rules.
+ * @return A C-string containing the JSON data, or an error JSON. Needs to be freed by free_c_string().
+ */
+const char* get_filtered_video_info_json(const char* video_url_c_str, const char* filter_criteria_c_str);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
