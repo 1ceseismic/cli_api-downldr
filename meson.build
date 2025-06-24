@@ -2,36 +2,34 @@ project('yt-cli-downloader', 'cpp',
   version : '0.1',
   default_options : ['warning_level=3', 'cpp_std=c++17'])
 
-# --- Dependencies ---
-# nlohmann/json: Often used as a header-only library or via pkg-config if installed.
-# For header-only, you might just need to ensure it's in the include path.
-# If it provides a pkg-config file (e.g., nlohmann_json.pc), dependency() works.
-# If you add it as a subproject (e.g., in subprojects/nlohmann_json), you'd use:
-#   json_proj = subproject('nlohmann_json')
-#   json_dep = json_proj.get_variable('nlohmann_json_dep')
-# Assuming system/pkg-config for simplicity here:
-json_dep = dependency('nlohmann_json', version: '>=3.0.0', required: true)
+# --- Subproject Dependencies ---
 
-# cpr (C++ Requests): Typically depends on libcurl.
-# Similar to json, can be system-installed (with pkg-config for cpr and libcurl)
-# or included as a subproject.
-# If cpr is built as a static/shared lib and installed with a .pc file:
-cpr_dep = dependency('cpr', version: '>=1.6.0', required: true) # cpr itself
-# libcurl is a common dependency for cpr. Often cpr's own build system or pkg-config handles linking it.
-# If cpr's .pc file doesn't list libcurl as a requirement, or if you link cpr manually,
-# you might need to declare libcurl explicitly:
-# curl_dep = dependency('libcurl', required: true)
-# However, a well-packaged cpr should handle this.
+# nlohmann/json (header-only, fetched via wrap file)
+# The subproject 'nlohmann_json' (directory name from .wrap) should have a meson.build
+# that defines the variable 'nlohmann_json_dep' (from [provide] section of .wrap).
+json_sub = subproject('nlohmann_json')
+json_dep = json_sub.get_variable('nlohmann_json_dep')
 
-# If cpr is used as header-only but still needs libcurl linked:
-# curl_dep = dependency('libcurl', required: true)
-# And cpr headers would need to be in include_directories.
-# For this example, we assume cpr is a library found by pkg-config.
+# CPR (C++ Requests, fetched via wrap file)
+# The subproject 'cpr' (directory name from .wrap) should have a meson.build
+# that defines the variable 'cpr_dep' (from [provide] section of .wrap).
+# CPR's meson build should also handle its own dependency on libcurl.
+# We can pass options to subprojects if needed, for example, to encourage system curl usage
+# or disable tests for faster configuration.
+cpr_sub = subproject('cpr',
+  default_options : [
+    'CPR_BUILD_TESTS=disabled', # Don't build CPR's own tests
+    'CPR_GENERATE_COVERAGE=false', # Disable coverage for CPR
+    # 'CPR_USE_SYSTEM_CURL=true' # This can be an option if CPR's meson.build supports it explicitly
+                               # and you want to ensure it doesn't try to build its own curl.
+                               # Usually, CPR's meson will try `dependency('curl')` which is good.
+  ]
+)
+cpr_dep = cpr_sub.get_variable('cpr_dep')
+
 
 cpp_args = []
 link_args = []
-# Consolidate dependencies
-# If curl_dep was explicitly needed, add it here: deps = [json_dep, cpr_dep, curl_dep]
 deps = [json_dep, cpr_dep]
 
 

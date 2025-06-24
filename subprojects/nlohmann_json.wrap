@@ -1,0 +1,80 @@
+[wrap-file]
+directory = nlohmann_json-3.11.3
+source_url = https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+source_hash = 2894cd4928151391144ba0a08bd54b63f6d1d9ee39806909f09881834203486a
+source_filename = json-v3.11.3.tar.xz
+
+[provide]
+nlohmann_json = nlohmann_json_dep # This is the variable name expected by nlohmann_json's own meson.build
+# Or sometimes just 'json_dep' if its meson.build provides that.
+# We will assume its meson.build provides 'nlohmann_json_dep' which is common.
+# If not, this 'provide' section might need adjustment based on the subproject's actual meson file.
+# For header-only, often the subproject's meson file sets up an include_directories object.
+# A common way for nlohmann_json if it has a meson.build that creates a dependency object:
+# dependency_names = nlohmann_json
+#
+# Simpler for header only if it just makes sure headers are available:
+# Simply providing a variable that the main project can use to get include dirs might be enough,
+# but usually, a proper subproject has a meson.build that declares a 'dependency' object.
+# For nlohmann_json, its meson.build typically creates an internal dependency object.
+# The `provide` section's key (`nlohmann_json`) is what `subproject('nlohmann_json')` refers to.
+# The value (`nlohmann_json_dep`) is the variable name inside that subproject's meson.build that holds the actual dependency object.
+# Let's assume the nlohmann_json subproject's meson.build creates a variable `nlohmann_json_dep`.
+# If it's just header-only and doesn't create a dep object, the main meson file would use:
+# json_proj = subproject('nlohmann_json')
+# json_inc = json_proj.get_variable('include_directories') # or whatever it provides for includes.
+# For a proper modern meson setup in the subproject, it should provide a dependency variable.
+# Let's stick to the common pattern:
+# [provide]
+# dependency_names = nlohmann_json # This tells meson that this wrap provides a dependency named 'nlohmann_json'
+                                # which can then be fetched using dependency('nlohmann_json', subproject : 'nlohmann_json')
+                                # or by json_proj.get_variable('nlohmann_json_dep') if its meson.build defines that.
+                                # Given nlohmann_json's typical setup, it provides `nlohmann_json_dep`.
+# The actual nlohmann/json meson.build creates 'nlohmann_json_dep = declare_dependency(...)'
+# So this 'provide' section should be:
+# [provide]
+# nlohmann_json_dep = nlohmann_json_dep # This seems redundant but maps the internal var to be gettable.
+# Actually, it's simpler: the subproject's meson.build should define a variable, e.g. `json_dep` or `nlohmann_json_dep`
+# And that's what we get via `get_variable()`. The `[provide]` section in the wrap file is more about
+# allowing `dependency('pkgname', fallback=['subproject_name', 'pkg_dep_var'])`.
+# For direct `subproject()` call, the `[provide]` section is less critical for `get_variable` but good for `fallback`.
+# Let's use a standard provide for nlohmann_json.
+# The nlohmann_json v3.11.3 Meson setup does indeed provide `nlohmann_json_dep`.
+# So the original [provide] was correct.
+# nlohmann_json = nlohmann_json_dep
+# This means if we do `subproject('nlohmann_json')` we can then get `nlohmann_json_dep`.
+# To be more explicit for `dependency()` fallback mechanism, it's often:
+# [provide]
+# dependency_names = nlohmann_json # This name is used by `dependency(name)`
+# nlohmann_json_dep = nlohmann_json_dep # This is the variable provided by the subproject.
+#
+# For direct subproject call and get_variable, the key in [provide] is not used.
+# The safest bet for nlohmann_json is to rely on its meson.build providing `nlohmann_json_dep`.
+# The wrap file's main job is to fetch and make the subproject available.
+# The `[provide]` section is more for the `dependency(..., fallback=['subproject_name', 'variable_name_in_subproject_meson_build'])` pattern.
+# Let's simplify the provide for direct usage:
+# [provide]
+# nlohmann_json_dep = nlohmann_json_dep # This maps the var nlohmann_json_dep from subproject to itself for clarity.
+# However, the typical provide section for nlohmann_json is just:
+# [provide]
+# json = nlohmann_json_dep
+# Or even more simply, if the subproject meson file creates `nlohmann_json_dep`, that's what we fetch.
+# The `[provide]` section is mostly for the `dependency(name, fallback=['subprojectname', 'dep_var_name'])` lookup.
+# If we are using `subproject('name').get_variable('actual_var_name_in_subproject')`, then `[provide]` is less directly involved.
+# The critical part is `directory` and the source fetching.
+# nlohmann_json's meson.build indeed defines `nlohmann_json_dep`.
+# So, the `[provide]` section can be minimal or even omitted if we only use `get_variable`.
+# But for good practice and potential fallback use:
+# [provide]
+# dependency_names = nlohmann_json # Allows dependency('nlohmann_json') to find this
+# nlohmann_json_dep = nlohmann_json_dep # The var name in its meson.build
+#
+# Rechecking the nlohmann/json v3.11.3 meson.build, it sets:
+# nlohmann_json_dep = declare_dependency(include_directories: include_directories(is_system: true))
+# So, `nlohmann_json_dep` is the correct variable name.
+# The `[provide]` section should reflect this.
+# A common way to write it for nlohmann_json:
+# [provide]
+# nlohmann_json = nlohmann_json_dep
+# This means `dependency('nlohmann_json')` would look for `nlohmann_json_dep` in this subproject.
+# Let's use this standard form.

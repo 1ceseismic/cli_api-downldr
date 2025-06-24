@@ -4,6 +4,11 @@ This document outlines conceptual test cases for the `yt-cli-downloader` tool.
 The primary method for fetching video information is now **web page scraping (keyless)**.
 An API key is optional and serves as a fallback if scraping fails AND the key is provided.
 
+**Build & Dependency Management Note:** Dependencies (nlohmann/json, cpr) are managed
+as Meson subprojects. Conceptual testing of the build process involves verifying that
+Meson downloads and configures these subprojects correctly when `meson setup` is run.
+This document primarily focuses on runtime behavior.
+
 ## 1. Video ID Extraction (`extract_video_id` function)
 
 (This section remains unchanged as `extract_video_id` logic has not been altered.)
