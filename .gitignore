@@ -36,3 +36,6 @@ build/
 
 # Vendored libraries (if not managed by a package manager)
 libs/
+/_deps
+/.aider.tags.cache.v4
+.aider*
