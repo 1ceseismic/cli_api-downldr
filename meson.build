@@ -20,7 +20,7 @@ cpr_sub = subproject('cpr',
   default_options : [
     'CPR_BUILD_TESTS=disabled', # Don't build CPR's own tests
     'CPR_GENERATE_COVERAGE=false', # Disable coverage for CPR
-    # 'CPR_USE_SYSTEM_CURL=true' # This can be an option if CPR's meson.build supports it explicitly
+    'CPR_USE_SYSTEM_CURL=true' # This can be an option if CPR's meson.build supports it explicitly
                                # and you want to ensure it doesn't try to build its own curl.
                                # Usually, CPR's meson will try `dependency('curl')` which is good.
   ]

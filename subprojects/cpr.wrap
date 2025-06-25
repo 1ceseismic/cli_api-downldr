@@ -1,18 +1,13 @@
-[wrap-git]
-url = https://github.com/libcpr/cpr.git
-revision = 1.10.5
-directory = cpr-1.10.5
+[wrap-file]
+directory = cpr-1.12.0
+source_url = https://github.com/libcpr/cpr/archive/1.12.0.tar.gz
+source_filename = cpr-1.12.0.tar.gz
+source_hash = f64b501de66e163d6a278fbb6a95f395ee873b7a66c905dd785eae107266a709
+patch_filename = cpr_1.12.0-1_patch.zip
+patch_url = https://wrapdb.mesonbuild.com/v2/cpr_1.12.0-1/get_patch
+patch_hash = 16404431dd8b2dbb49afc78a07b3bbe3c84c9f83ce1f45c3510934fadab99e72
+source_fallback_url = https://github.com/mesonbuild/wrapdb/releases/download/cpr_1.12.0-1/cpr-1.12.0.tar.gz
+wrapdb_version = 1.12.0-1
 
 [provide]
 cpr = cpr_dep
-# CPR's meson.build file should define 'cpr_dep'.
-# It should also handle its own dependency on libcurl,
-# ideally by using `dependency('libcurl', required: true)` itself,
-# which Meson would then try to find system-wide or via another subproject if specified.
-
-# Options that might be relevant for CPR's own meson.build:
-# CPR_USE_SYSTEM_CURL=true (usually default or preferred)
-# CPR_FORCE_USE_SYSTEM_CURL=true
-# BUILD_CPR_TESTS=false (to speed up subproject build)
-# Ensure these options align with how CPR's meson.build is written if you need to override defaults.
-# For now, we won't set them in the wrap, assuming CPR's defaults are fine.
