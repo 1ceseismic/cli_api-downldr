@@ -4,13 +4,44 @@
 #include <map>
 #include <fstream> // For file operations
 #include <algorithm> // For std::min
+#include <regex> // For player URL extraction
+#include <memory> // For std::unique_ptr
+#include <mutex>  // For std::mutex
+#include <filesystem> // For std::filesystem::create_directories (C++17)
 
 // HTTP and JSON libraries - Assuming these are available and discoverable by the build system
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
+#include "yt_sig_decipher.hpp" // For signature deciphering
 using json = nlohmann::json;
 
 #define PROJECT_NAME "yt-cli-downloader"
+
+// Global or static decipherer instance
+// Could also be a member of VideoInfo or passed around.
+// For simplicity here, a global static pointer, initialized once.
+static std::unique_ptr<SignatureDecipherer> global_decipherer;
+static std::mutex decipherer_mutex; // To protect initialization
+
+void ensure_decipherer_initialized(const std::string& player_script_content) {
+    if (!global_decipherer) {
+        std::lock_guard<std::mutex> lock(decipherer_mutex);
+        if (!global_decipherer) { // Double-check lock
+            if (!player_script_content.empty()) {
+                global_decipherer = std::make_unique<SignatureDecipherer>();
+                if (!global_decipherer->initialize_operations(player_script_content)) {
+                    std::cerr << "Failed to initialize global signature decipherer with player script." << std::endl;
+                    // global_decipherer will remain null if init fails this way
+                    global_decipherer.reset(); // Ensure it's null if init failed
+                } else {
+                    std::cout << "Global signature decipherer initialized successfully." << std::endl;
+                }
+            } else {
+                std::cerr << "Player script content is empty, cannot initialize global decipherer." << std::endl;
+            }
+        }
+    }
+}
 
 // Helper to generate a somewhat safe filename
 std::string sanitize_filename(const std::string& name) {
@@ -73,6 +104,71 @@ std::string extract_video_id(const std::string& url) {
     return ""; // Return empty if no standard pattern matches
 }
 
+// Helper function to extract player.js URL from HTML
+std::string extract_player_url(const std::string& html_content) {
+    // Common regex based on yt-dlp's approach for /s/player/.../base.js
+    // This regex tries to find a path like "/s/player/xxxxxxxx/player_ias.vflset/en_US/base.js"
+    // It might need adjustments if YouTube changes its structure significantly.
+    std::regex player_regex(R"~("(?:PLAYER_JS_URL|jsUrl)"\s*:\s*"([^"]+\/base\.js)")~");
+    std::smatch match;
+
+    if (std::regex_search(html_content, match, player_regex) && match.size() > 1) {
+        std::string player_url = match[1].str();
+        // The extracted URL might be relative, e.g., /s/player/...
+        // Or it might be an absolute URL if the regex is adjusted or YouTube changes format.
+        // For now, assume it's a path that needs to be prepended with "https://www.youtube.com"
+        // if it doesn't start with "http".
+        if (player_url.rfind("http", 0) != 0) { // starts with "http" (covers http and https)
+             if (player_url.rfind("//", 0) == 0) { // starts with "//"
+                return "https:" + player_url;
+            } else if (player_url.rfind("/", 0) == 0) { // starts with "/"
+                return "https://www.youtube.com" + player_url;
+            }
+            // If it's not clearly relative or absolute in a known way, it might be problematic.
+            // However, yt-dlp patterns usually yield paths like /s/player/...
+        }
+        return player_url; // Already absolute or correctly prepended
+    } else {
+        // Fallback regex: Try to find any base.js URL, less specific
+        std::regex fallback_regex(R"~((/s/player/[a-zA-Z0-9\-_]+(?:/[a-zA-Z0-9\-_]+)?/base\.js))~");
+        if (std::regex_search(html_content, match, fallback_regex) && match.size() > 1) {
+            std::string player_url = match[1].str();
+             if (player_url.rfind("http", 0) != 0) {
+                if (player_url.rfind("//", 0) == 0) {
+                    return "https:" + player_url;
+                } else if (player_url.rfind("/", 0) == 0) {
+                    return "https://www.youtube.com" + player_url;
+                }
+            }
+            return player_url;
+        }
+    }
+    std::cerr << "Warning: Could not extract player_js_url from HTML." << std::endl;
+    return "";
+}
+
+// Helper function to fetch the content of the player script
+std::string fetch_player_script_content(const std::string& player_url) {
+    if (player_url.empty()) {
+        std::cerr << "Player URL is empty, cannot fetch script." << std::endl;
+        return "";
+    }
+    std::cout << "Fetching player script from: " << player_url << std::endl;
+    cpr::Response r = cpr::Get(cpr::Url{player_url},
+                               cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
+
+    if (r.status_code == 200) {
+        std::cout << "Successfully fetched player script. Length: " << r.text.length() << " bytes." << std::endl;
+        return r.text;
+    } else {
+        std::cerr << "Failed to fetch player script. Status code: " << r.status_code << std::endl;
+        if (!r.error.message.empty()) {
+            std::cerr << "CPR Error: " << r.error.message << std::endl;
+        }
+        return "";
+    }
+}
+
 
 // Function to fetch video info.
 // Tries keyless method (web page scraping) first.
@@ -80,6 +176,8 @@ std::string extract_video_id(const std::string& url) {
 VideoInfo fetch_video_info(const std::string& video_id, const std::string& api_key = "") {
     VideoInfo info;
     info.id = video_id;
+    std::string player_script_url; // To store the extracted player URL
+    std::string player_script_content; // To store the fetched player script
     bool scraping_successful = false;
 
     std::cout << "Attempting to fetch video info for ID: " << video_id << " using web scraping." << std::endl;
@@ -91,6 +189,25 @@ VideoInfo fetch_video_info(const std::string& video_id, const std::string& api_k
     if (r.status_code == 200) {
         std::string html_content = r.text;
         std::string json_str;
+
+        // Extract player script URL
+        player_script_url = extract_player_url(html_content);
+        if (!player_script_url.empty()) {
+            // std::cout << "Found player script URL: " << player_script_url << std::endl; // Already printed by extract_player_url
+            player_script_content = fetch_player_script_content(player_script_url);
+            if (player_script_content.empty()) {
+                std::cerr << "Failed to fetch player script content. Signature deciphering will likely fail." << std::endl;
+            } else {
+                // Initialize the global decipherer with the fetched script content
+                // This should ideally only happen once per player script version.
+                // For simplicity, we call it here. A more advanced caching/management
+                // would be needed if dealing with multiple player versions concurrently.
+                ensure_decipherer_initialized(player_script_content);
+            }
+        } else {
+            // Player script URL not found, ensure_decipherer_initialized will not be called with content
+             ensure_decipherer_initialized(""); // Call with empty to indicate no script
+        }
 
         // Try to find "var ytInitialPlayerResponse = {"
         size_t start_pos = html_content.find("var ytInitialPlayerResponse = {");
@@ -232,16 +349,48 @@ VideoInfo fetch_video_info(const std::string& video_id, const std::string& api_k
                                 // URL or Cipher
                                 if (fmt_json.contains("url") && fmt_json["url"].is_string()) {
                                     fmt.url = fmt_json["url"].get<std::string>();
-                                } else if (fmt_json.contains("signatureCipher") && fmt_json["signatureCipher"].is_string()) {
-                                    // TODO: Implement signature deciphering
-                                    // For now, mark URL as needing deciphering and log
-                                    fmt.url = "NEEDS_DECIPHERING";
-                                    std::cout << "Note: Format itag " << fmt.itag << " requires signature deciphering (URL in signatureCipher)." << std::endl;
-                                } else if (fmt_json.contains("cipher") && fmt_json["cipher"].is_string()) { // Older format for cipher
-                                     fmt.url = "NEEDS_DECIPHERING_OLD";
-                                     std::cout << "Note: Format itag " << fmt.itag << " requires signature deciphering (URL in cipher)." << std::endl;
-                                }
-                                else {
+                                } else if ((fmt_json.contains("signatureCipher") && fmt_json["signatureCipher"].is_string()) ||
+                                           (fmt_json.contains("cipher") && fmt_json["cipher"].is_string()) ) {
+
+                                    std::string cipher_str = fmt_json.contains("signatureCipher") ?
+                                                             fmt_json["signatureCipher"].get<std::string>() :
+                                                             fmt_json["cipher"].get<std::string>();
+
+                                    std::cout << "Note: Format itag " << fmt.itag << " requires signature deciphering. Cipher: " << cipher_str.substr(0, 50) << "..." << std::endl;
+
+                                    if (global_decipherer) {
+                                        std::string base_url, encrypted_s, sig_param_name;
+                                        if (SignatureDecipherer::parse_signature_cipher(cipher_str, base_url, encrypted_s, sig_param_name)) {
+                                            std::cout << "  Parsed cipher: URL=" << base_url.substr(0,30) << "..., S=" << encrypted_s.substr(0,20) << "..., SP=" << sig_param_name << std::endl;
+                                            std::string deciphered_s = global_decipherer->decipher_signature(encrypted_s);
+
+                                            if (!deciphered_s.empty() && deciphered_s.find("PLACEHOLDER") == std::string::npos) {
+                                                // Construct the full URL
+                                                // Check if base_url already contains query params
+                                                if (base_url.find('?') == std::string::npos) {
+                                                    fmt.url = base_url + "?" + sig_param_name + "=" + deciphered_s;
+                                                } else {
+                                                    fmt.url = base_url + "&" + sig_param_name + "=" + deciphered_s;
+                                                }
+                                                std::cout << "  Successfully deciphered signature for itag " << fmt.itag << ". New URL (part): " << fmt.url.substr(0, 60) << "..." << std::endl;
+                                            } else {
+                                                std::cerr << "  Failed to decipher signature for itag " << fmt.itag << "." << std::endl;
+                                                if(deciphered_s.empty()){
+                                                    std::cerr << "   Decipher function returned empty string." << std::endl;
+                                                } else {
+                                                    std::cerr << "   Decipher function returned placeholder or error indicator: " << deciphered_s << std::endl;
+                                                }
+                                                fmt.url = "DECIPHER_FAILED"; // Mark as failed
+                                            }
+                                        } else {
+                                            std::cerr << "  Failed to parse signature cipher for itag " << fmt.itag << "." << std::endl;
+                                            fmt.url = "CIPHER_PARSE_FAILED";
+                                        }
+                                    } else {
+                                        std::cerr << "  Global decipherer not available for itag " << fmt.itag << "." << std::endl;
+                                        fmt.url = "NO_DECIPHERER";
+                                    }
+                                } else {
                                     fmt.url = ""; // No URL and no cipher means it's likely unusable
                                     std::cout << "Warning: Format itag " << fmt.itag << " has no URL or cipher." << std::endl;
                                 }
@@ -333,12 +482,18 @@ void display_video_info(const VideoInfo& info) {
 
 // Function for downloading a video format
 bool download_video_format(const VideoInfo& video_info, const VideoFormat& format_to_download, const std::string& output_dir = ".") {
-    if (format_to_download.url.empty() ||
-        format_to_download.url == "NEEDS_DECIPHERING" ||
-        format_to_download.url == "NEEDS_DECIPHERING_OLD") {
-        std::cerr << "Error: Download URL for itag " << format_to_download.itag
-                  << " requires signature deciphering, which is not implemented." << std::endl;
-        std::cerr << "       Unable to download this format." << std::endl;
+    if (format_to_download.url.empty()) {
+        std::cerr << "Error: Download URL for itag " << format_to_download.itag << " is empty." << std::endl;
+        return false;
+    }
+    if (format_to_download.url == "NEEDS_DECIPHERING" ||
+        format_to_download.url == "NEEDS_DECIPHERING_OLD" ||
+        format_to_download.url == "NO_DECIPHERER" ||
+        format_to_download.url == "DECIPHER_FAILED" ||
+        format_to_download.url == "CIPHER_PARSE_FAILED") {
+        std::cerr << "Error: Cannot download itag " << format_to_download.itag
+                  << ". Reason: URL is '" << format_to_download.url << "'." << std::endl;
+        std::cerr << "       This typically means signature deciphering failed or was not possible." << std::endl;
         return false;
     }
     if (format_to_download.url.rfind("api_url_", 0) == 0) { // Check if URL starts with "api_url_"
@@ -346,7 +501,6 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
                   << " is a placeholder API URL. API download not fully implemented." << std::endl;
         return false;
     }
-
 
     // Construct a filename. e.g., "VideoTitle_itag.container"
     std::string base_filename = sanitize_filename(video_info.title.empty() ? video_info.id : video_info.title);
@@ -363,17 +517,22 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
               << " from URL: " << format_to_download.url
               << " to " << filename << std::endl;
 
-    // Ensure output directory exists (basic check, could be more robust)
-    // For simplicity, this assumes the directory needs to be created if it doesn't exist.
-    // A more robust solution would use filesystem libraries.
-    #if defined(_WIN32)
-        std::string command = "mkdir \"" + output_dir + "\"";
-        system(command.c_str()); // Not ideal, but simple for this example
-    #else
-        std::string command = "mkdir -p \"" + output_dir + "\"";
-        system(command.c_str()); // Not ideal, but simple for this example
-    #endif
-
+    // Ensure output directory exists using C++17 filesystem
+    try {
+        if (!output_dir.empty() && output_dir != ".") { // Avoid creating "." if it's the current dir
+            std::filesystem::path dir_path(output_dir);
+            if (!std::filesystem::exists(dir_path)) {
+                std::cout << "Creating output directory: " << output_dir << std::endl;
+                if (!std::filesystem::create_directories(dir_path)) {
+                    std::cerr << "Error: Could not create output directory: " << output_dir << std::endl;
+                    // Optionally, one might decide to return false here if dir creation is critical
+                }
+            }
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Filesystem error while checking/creating output directory: " << e.what() << std::endl;
+        // Optionally, return false
+    }
 
     std::ofstream outfile(filename, std::ios::binary);
     if (!outfile.is_open()) {
