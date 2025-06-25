@@ -331,52 +331,86 @@ void display_video_info(const VideoInfo& info) {
     std::cout << "-------------------------" << std::endl;
 }
 
-// Placeholder function for downloading a video format
+// Function for downloading a video format
 bool download_video_format(const VideoInfo& video_info, const VideoFormat& format_to_download, const std::string& output_dir = ".") {
-    if (format_to_download.url.empty() || format_to_download.url == "example_url") { // Check against placeholder
-        std::cerr << "Error: Download URL for itag " << format_to_download.itag << " is missing or invalid (placeholder)." << std::endl;
+    if (format_to_download.url.empty() ||
+        format_to_download.url == "NEEDS_DECIPHERING" ||
+        format_to_download.url == "NEEDS_DECIPHERING_OLD") {
+        std::cerr << "Error: Download URL for itag " << format_to_download.itag
+                  << " requires signature deciphering, which is not implemented." << std::endl;
+        std::cerr << "       Unable to download this format." << std::endl;
+        return false;
+    }
+    if (format_to_download.url.rfind("api_url_", 0) == 0) { // Check if URL starts with "api_url_"
+        std::cerr << "Error: Download URL for itag " << format_to_download.itag
+                  << " is a placeholder API URL. API download not fully implemented." << std::endl;
         return false;
     }
 
+
     // Construct a filename. e.g., "VideoTitle_itag.container"
     std::string base_filename = sanitize_filename(video_info.title.empty() ? video_info.id : video_info.title);
-    std::string filename = output_dir + "/" + base_filename + "_" + format_to_download.itag + "." + format_to_download.container;
+    std::string filename_extension = format_to_download.container;
+    // Basic sanitation for extension to avoid issues like "mp4; codecs=..."
+    size_t semicolon_pos = filename_extension.find(';');
+    if (semicolon_pos != std::string::npos) {
+        filename_extension = filename_extension.substr(0, semicolon_pos);
+    }
+    std::string filename = output_dir + "/" + base_filename + "_" + format_to_download.itag + "." + filename_extension;
 
     std::cout << "Attempting to download format " << format_to_download.itag
               << " for video '" << video_info.title << "'"
               << " from URL: " << format_to_download.url
-              << " to " << filename
-              << " (Download not implemented yet)" << std::endl;
+              << " to " << filename << std::endl;
 
-    // **Actual Download Implementation Would Be Here**
-    // 1. Create an output file stream: std::ofstream outfile(filename, std::ios::binary);
-    // 2. Make HTTP GET request using a library like cpr, with streaming support.
-    //    Example conceptual cpr usage for streaming download:
-    //    cpr::Response r = cpr::Download(outfile, cpr::Url{format_to_download.url});
-    //    if (r.status_code == 200 && r.error.code == cpr::ErrorCode::OK) {
-    //        std::cout << "Download completed successfully: " << filename << std::endl;
-    //        return true;
-    //    } else {
-    //        std::cerr << "Download failed. Status: " << r.status_code << ", Error: " << r.error.message << std::endl;
-    //        // Potentially delete partially downloaded file: std::remove(filename.c_str());
-    //        return false;
-    //    }
+    // Ensure output directory exists (basic check, could be more robust)
+    // For simplicity, this assumes the directory needs to be created if it doesn't exist.
+    // A more robust solution would use filesystem libraries.
+    #if defined(_WIN32)
+        std::string command = "mkdir \"" + output_dir + "\"";
+        system(command.c_str()); // Not ideal, but simple for this example
+    #else
+        std::string command = "mkdir -p \"" + output_dir + "\"";
+        system(command.c_str()); // Not ideal, but simple for this example
+    #endif
 
-    // --- Placeholder behavior ---
-    std::cout << "Simulating download for " << filename << "..." << std::endl;
-    // Create a dummy file to signify download
-    std::ofstream dummy_outfile(filename);
-    if (dummy_outfile) {
-        dummy_outfile << "This is a placeholder for the downloaded video content for itag "
-                      << format_to_download.itag << " of video " << video_info.title << std::endl;
-        dummy_outfile.close();
-        std::cout << "Placeholder file created: " << filename << std::endl;
-        return true;
-    } else {
-        std::cerr << "Failed to create placeholder file: " << filename << std::endl;
+
+    std::ofstream outfile(filename, std::ios::binary);
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << filename << std::endl;
         return false;
     }
-    // --- End Placeholder behavior ---
+
+    // Make HTTP GET request using cpr for downloading
+    // Use a User-Agent, as some servers might block requests without one.
+    cpr::Response r = cpr::Download(outfile, cpr::Url{format_to_download.url},
+                                  cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
+
+    if (r.status_code >= 200 && r.status_code < 300 && r.error.code == cpr::ErrorCode::OK) {
+        std::cout << "Download completed successfully: " << filename << std::endl;
+        std::cout << "Downloaded " << r.downloaded_bytes << " bytes." << std::endl;
+        return true;
+    } else {
+        std::cerr << "Download failed." << std::endl;
+        std::cerr << "  Status code: " << r.status_code << std::endl;
+        if (!r.error.message.empty()) {
+             std::cerr << "  CPR Error: " << r.error.message << std::endl;
+        }
+        if (!r.status_line.empty()){
+            std::cerr << "  Status line: " << r.status_line << std::endl;
+        }
+        if(!r.text.empty() && r.text.length() < 500) { // Print small error bodies
+            std::cerr << "  Response body: " << r.text << std::endl;
+        }
+        // Potentially delete partially downloaded file
+        outfile.close(); // Close before attempting to remove
+        if (std::remove(filename.c_str()) != 0) {
+            // std::perror(("Error deleting partial file " + filename).c_str()); // More detailed error
+        } else {
+            std::cout << "Partially downloaded file " << filename << " removed." << std::endl;
+        }
+        return false;
+    }
 }
 
 
@@ -495,7 +529,7 @@ int main(int argc, char **argv) {
         if (format_to_download != nullptr) {
             std::cout << "\nAttempting download for selected itag: " << selected_format_itag << std::endl;
             if (download_video_format(video_info, *format_to_download, output_directory)) {
-                std::cout << "Download process for itag " << selected_format_itag << " initiated successfully (simulated)." << std::endl;
+                std::cout << "Download process for itag " << selected_format_itag << " completed." << std::endl;
             } else {
                 std::cerr << "Download process for itag " << selected_format_itag << " failed." << std::endl;
             }
