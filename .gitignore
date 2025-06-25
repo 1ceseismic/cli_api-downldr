@@ -39,3 +39,4 @@ libs/
 /_deps
 /.aider.tags.cache.v4
 .aider*
+/subprojects
