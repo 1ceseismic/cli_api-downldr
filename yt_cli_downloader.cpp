@@ -10,6 +10,9 @@
 #include <cstdio> // For popen
 #include <array>  // For reading command output
 #include <cctype> // For isdigit
+#include <cmath>  // For pow, log in format_bytes
+#include <iomanip> // For setprecision, std::fixed for progress display
+#include <chrono> // For download speed calculation
 
 // HTTP and JSON libraries - Assuming these are available and discoverable by the build system
 #include <cpr/cpr.h>
@@ -17,6 +20,34 @@
 using json = nlohmann::json;
 
 #define PROJECT_NAME "yt-cli-downloader"
+
+// Helper function to format bytes into human-readable string (KB, MB, GB)
+std::string format_bytes(long long bytes) {
+    if (bytes == 0) {
+        return "0 B";
+    }
+    const char* suffixes[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB"};
+    int suffix_idx = 0;
+    double d_bytes = static_cast<double>(bytes);
+
+    if (bytes > 0) { // Avoid log(0) or log of negative
+      suffix_idx = static_cast<int>(std::floor(std::log2(d_bytes) / 10.0)); // log2(1024) is 10
+      if (suffix_idx < 0) suffix_idx = 0; // Should not happen for bytes > 0
+      if (suffix_idx >= sizeof(suffixes) / sizeof(suffixes[0])) {
+          suffix_idx = (sizeof(suffixes) / sizeof(suffixes[0])) - 1; // Use largest suffix
+      }
+      d_bytes /= std::pow(1024.0, suffix_idx);
+    }
+
+
+    char buffer[64];
+    if (suffix_idx == 0) { // Bytes
+        snprintf(buffer, sizeof(buffer), "%lld %s", bytes, suffixes[suffix_idx]);
+    } else {
+        snprintf(buffer, sizeof(buffer), "%.2f %s", d_bytes, suffixes[suffix_idx]);
+    }
+    return std::string(buffer);
+}
 
 // Function to execute a command and get its standard output
 // Uses popen, which is POSIX-specific. For Windows, _popen or CreateProcess would be needed.
@@ -144,6 +175,7 @@ struct VideoFormat {
     std::string codecs;
     std::string type;
     std::string url;
+    long long filesize = 0; // Initialize to 0, will be populated from yt-dlp
 };
 
 // Basic structure to hold video metadata
@@ -298,6 +330,15 @@ VideoInfo fetch_video_info(const std::string& video_url_or_id, const std::string
                 else if (has_audio) { fmt.type = "audio_only"; }
                 else { fmt.type = "unknown"; }
 
+                // Populate filesize
+                if (fmt_json.contains("filesize") && fmt_json["filesize"].is_number()) {
+                    fmt.filesize = fmt_json["filesize"].get<long long>();
+                } else if (fmt_json.contains("filesize_approx") && fmt_json["filesize_approx"].is_number()) {
+                    fmt.filesize = fmt_json["filesize_approx"].get<long long>();
+                } else {
+                    fmt.filesize = 0; // Or -1 to indicate unknown, but 0 is fine for now
+                }
+
                 info.formats.push_back(fmt);
             }
         }
@@ -325,9 +366,12 @@ void display_video_info(const VideoInfo& info) {
     if (!info.formats.empty()) {
         std::cout << "\n--- Available Formats ---" << std::endl;
         for (const auto& fmt : info.formats) {
-            std::cout << "Itag: " << fmt.itag << ", Type: " << fmt.type
-                      << ", Quality: " << fmt.quality << ", Container: " << fmt.container
+            std::cout << "Itag: " << fmt.itag
+                      << ", Type: " << fmt.type
+                      << ", Quality: " << fmt.quality
+                      << ", Container: " << fmt.container
                       << ", Codecs: " << fmt.codecs
+                      << ", Size: " << (fmt.filesize > 0 ? format_bytes(fmt.filesize) : "N/A")
                       << std::endl;
         }
     } else {
@@ -376,15 +420,92 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
         return false;
     }
 
+    // Progress reporting variables
+    struct ProgressData {
+        std::chrono::steady_clock::time_point last_update_time;
+        std::chrono::steady_clock::time_point download_start_time;
+        double last_downloaded_bytes = 0;
+        long long total_bytes_to_download = 0;
+        bool first_call = true;
+    };
+    ProgressData progress_data;
+    progress_data.total_bytes_to_download = format_to_download.filesize;
+    progress_data.download_start_time = std::chrono::steady_clock::now();
+    progress_data.last_update_time = std::chrono::steady_clock::now();
+
+
+    auto progress_callback = cpr::ProgressCallback(
+        [&](cpr::cpr_off_t downloadTotal, cpr::cpr_off_t downloadNow,
+            cpr::cpr_off_t /*uploadTotal*/, cpr::cpr_off_t /*uploadNow*/,
+            intptr_t /*userdata*/) -> bool {
+
+        auto current_time = std::chrono::steady_clock::now();
+        std::chrono::duration<double> time_since_last_update = current_time - progress_data.last_update_time;
+        std::chrono::duration<double> time_since_start = current_time - progress_data.download_start_time;
+
+        // Only update display roughly every 500ms or if download completed (downloadNow == downloadTotal)
+        // or if it's the very first call to establish the baseline.
+        // downloadTotal from CPR callback is often 0 if server doesn't send Content-Length, so use our known filesize.
+        long long effective_total_bytes = progress_data.total_bytes_to_download > 0 ? progress_data.total_bytes_to_download : static_cast<long long>(downloadTotal);
+
+        if (progress_data.first_call || time_since_last_update.count() >= 0.5 || (effective_total_bytes > 0 && downloadNow == effective_total_bytes)) {
+            progress_data.first_call = false;
+            double bytes_downloaded_since_last = static_cast<double>(downloadNow) - progress_data.last_downloaded_bytes;
+            double current_speed_bps = 0;
+            if (time_since_last_update.count() > 0.001) { // Avoid division by zero if calls are too rapid
+                current_speed_bps = bytes_downloaded_since_last / time_since_last_update.count();
+            }
+
+            double average_speed_bps = 0;
+            if (time_since_start.count() > 0.001) {
+                 average_speed_bps = static_cast<double>(downloadNow) / time_since_start.count();
+            }
+
+            std::string eta_str = "ETA: N/A";
+            if (effective_total_bytes > 0 && average_speed_bps > 0.001 && downloadNow < effective_total_bytes) {
+                double remaining_bytes = static_cast<double>(effective_total_bytes - downloadNow);
+                double eta_seconds = remaining_bytes / average_speed_bps;
+                int h = static_cast<int>(eta_seconds / 3600);
+                int m = static_cast<int>((eta_seconds - h * 3600) / 60);
+                int s = static_cast<int>(eta_seconds - h * 3600 - m * 60);
+                char eta_buffer[32];
+                snprintf(eta_buffer, sizeof(eta_buffer), "ETA: %02d:%02d:%02d", h, m, s);
+                eta_str = eta_buffer;
+            } else if (effective_total_bytes > 0 && downloadNow >= effective_total_bytes) {
+                eta_str = "ETA: Done";
+            }
+
+
+            std::cout << "\rProgress: ";
+            if (effective_total_bytes > 0) {
+                double percentage = (static_cast<double>(downloadNow) / effective_total_bytes) * 100.0;
+                std::cout << std::fixed << std::setprecision(1) << percentage << "% | ";
+            }
+            std::cout << format_bytes(downloadNow)
+                      << (effective_total_bytes > 0 ? " / " + format_bytes(effective_total_bytes) : "")
+                      << " | Speed: " << format_bytes(static_cast<long long>(current_speed_bps)) << "/s"
+                      << " | Avg Speed: " << format_bytes(static_cast<long long>(average_speed_bps)) << "/s"
+                      << " | " << eta_str
+                      << std::flush; // Flush to ensure \r works
+
+            progress_data.last_downloaded_bytes = static_cast<double>(downloadNow);
+            progress_data.last_update_time = current_time;
+        }
+        return true; // Continue download
+    });
+
     cpr::Response r = cpr::Download(outfile, cpr::Url{format_to_download.url},
-                                  cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
+                                  cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}},
+                                  progress_callback);
+
+    std::cout << std::endl; // Newline after download finishes to clear progress line
 
     if (r.status_code >= 200 && r.status_code < 300 && r.error.code == cpr::ErrorCode::OK) {
-        std::cout << "Download completed successfully: " << filename << std::endl;
-        std::cout << "Downloaded " << r.downloaded_bytes << " bytes." << std::endl;
+        // std::cout << "Download completed successfully: " << filename << std::endl; // Already indicated by progress
+        std::cout << "Final size: " << format_bytes(r.downloaded_bytes) << ". Saved to: " << filename << std::endl;
         return true;
     } else {
-        std::cerr << "Download failed." << std::endl;
+        std::cout << "Download failed." << std::endl; // Ensure this is on a new line
         std::cerr << "  Status code: " << r.status_code << std::endl;
         if (!r.error.message.empty()) {
              std::cerr << "  CPR Error: " << r.error.message << std::endl;
