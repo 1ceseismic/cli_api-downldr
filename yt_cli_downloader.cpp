@@ -187,24 +187,11 @@ VideoInfo fetch_video_info(const std::string& video_url_or_id, const std::string
     VideoInfo info;
     info.id = video_url_or_id;
 
-    std::string escaped_input = video_url_or_id;
-    // Basic escape for single quotes for shell safety if wrapped in single quotes
-    // This is a very naive way to escape for shell. A library or more robust method is preferred for general inputs.
-    // For YouTube IDs/URLs, it's usually fine.
-    {
-        std::string temp_escaped;
-        for(char c : escaped_input) {
-            if (c == '\'') {
-                temp_escaped += "'\\''"; // Replace ' with '\'', effectively breaking out and re-entering single quotes
-            } else {
-                temp_escaped += c;
-            }
-        }
-        escaped_input = temp_escaped;
-    }
-
-
-    std::string command = "yt-dlp -j --no-warnings --no-playlist '" + escaped_input + "'";
+    // Construct the command. Pass video_url_or_id directly without extra quotes.
+    // The shell invoked by popen will parse arguments. As long as video_url_or_id
+    // doesn't contain spaces or special shell characters (typical for YT URLs/IDs),
+    // it will be treated as a single argument to yt-dlp.
+    std::string command = "yt-dlp -j --no-warnings --no-playlist " + video_url_or_id;
     std::cout << "Fetching video info using yt-dlp (this might take a moment)..." << std::endl;
 
     std::string json_output = execute_command_and_get_output(command);
