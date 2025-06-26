@@ -4,44 +4,125 @@
 #include <map>
 #include <fstream> // For file operations
 #include <algorithm> // For std::min
-#include <regex> // For player URL extraction
+#include <regex> // For player URL extraction (no longer used for core logic but was here)
 #include <memory> // For std::unique_ptr
-#include <mutex>  // For std::mutex
 #include <filesystem> // For std::filesystem::create_directories (C++17)
+#include <cstdio> // For popen
+#include <array>  // For reading command output
+#include <cctype> // For isdigit
 
 // HTTP and JSON libraries - Assuming these are available and discoverable by the build system
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
-#include "yt_sig_decipher.hpp" // For signature deciphering
 using json = nlohmann::json;
 
 #define PROJECT_NAME "yt-cli-downloader"
 
-// Global or static decipherer instance
-// Could also be a member of VideoInfo or passed around.
-// For simplicity here, a global static pointer, initialized once.
-static std::unique_ptr<SignatureDecipherer> global_decipherer;
-static std::mutex decipherer_mutex; // To protect initialization
+// Function to execute a command and get its standard output
+// Uses popen, which is POSIX-specific. For Windows, _popen or CreateProcess would be needed.
+std::string execute_command_and_get_output(const std::string& command) {
+    std::array<char, 128> buffer;
+    std::string result;
+    // std::cout << "Executing command: " << command << std::endl; // Make less verbose for version check
 
-void ensure_decipherer_initialized(const std::string& player_script_content) {
-    if (!global_decipherer) {
-        std::lock_guard<std::mutex> lock(decipherer_mutex);
-        if (!global_decipherer) { // Double-check lock
-            if (!player_script_content.empty()) {
-                global_decipherer = std::make_unique<SignatureDecipherer>();
-                if (!global_decipherer->initialize_operations(player_script_content)) {
-                    std::cerr << "Failed to initialize global signature decipherer with player script." << std::endl;
-                    // global_decipherer will remain null if init fails this way
-                    global_decipherer.reset(); // Ensure it's null if init failed
-                } else {
-                    std::cout << "Global signature decipherer initialized successfully." << std::endl;
-                }
-            } else {
-                std::cerr << "Player script content is empty, cannot initialize global decipherer." << std::endl;
-            }
+    std::string command_with_stderr = command + " 2>&1";
+
+    FILE* pipe = popen(command_with_stderr.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "popen() failed for command: " << command << std::endl;
+        return "POPEN_FAILED";
+    }
+    try {
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            result += buffer.data();
+        }
+    } catch (...) {
+        pclose(pipe);
+        std::cerr << "Exception while reading pipe for command: " << command << std::endl;
+        return "PIPE_READ_EXCEPTION";
+    }
+
+    int status = pclose(pipe);
+    if (status == -1) {
+        std::cerr << "pclose() failed for command: " << command << std::endl;
+    } else {
+        if (status != 0) {
+             // Don't print error for version check if it's just a "not found" type error,
+             // as check_ytdlp_availability will handle that.
+             if (command.find("--version") == std::string::npos) { // Only print for non-version check commands
+                std::cerr << "Command '" << command << "' exited with status " << status << "." << std::endl;
+             }
+             // If output contains error markers, it's an error regardless of exit status for yt-dlp -j
+             if (result.find("ERROR:") != std::string::npos || result.find("Traceback") != std::string::npos) {
+                // The result string now contains the error, return it.
+             } else if (status != 0) {
+                // For yt-dlp --version, a non-zero status with no clear error text might still be a problem
+                // We'll rely on check_ytdlp_availability to interpret this for --version
+                // For other commands, this is an issue.
+                // We already return result, so if it's not JSON, parsing will fail.
+             }
         }
     }
+    // Trim trailing newline if present, common from command output
+    if (!result.empty() && result.back() == '\n') {
+        result.pop_back();
+    }
+    return result;
 }
+
+bool check_ytdlp_availability() {
+    std::cout << "Checking for yt-dlp availability..." << std::endl;
+    std::string command = "yt-dlp --version";
+    std::string output = execute_command_and_get_output(command);
+
+    if (output == "POPEN_FAILED") {
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        std::cerr << "ERROR: Failed to execute 'yt-dlp --version'." << std::endl;
+        std::cerr << "This likely means 'yt-dlp' is not installed or not in your system's PATH." << std::endl;
+        std::cerr << "Please install yt-dlp. See: https://github.com/yt-dlp/yt-dlp" << std::endl;
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        return false;
+    }
+
+    // Check for common command not found patterns (stderr is redirected to output)
+    if (output.find("not recognized") != std::string::npos || // Windows "command not found"
+        output.find("command not found") != std::string::npos || // POSIX "command not found"
+        output.find("No such file or directory") != std::string::npos) {
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        std::cerr << "ERROR: 'yt-dlp' command not found." << std::endl;
+        std::cerr << "Please ensure yt-dlp is installed and in your system's PATH." << std::endl;
+        std::cerr << "Visit https://github.com/yt-dlp/yt-dlp for installation instructions." << std::endl;
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        return false;
+    }
+
+    if (output.find("ERROR:") != std::string::npos || output.find("Traceback") != std::string::npos) {
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        std::cerr << "ERROR: 'yt-dlp --version' command reported an error." << std::endl;
+        std::cerr << "This could mean yt-dlp itself has an issue or its dependencies are missing." << std::endl;
+        std::cerr << "Output was: " << output << std::endl;
+        std::cerr << "Please check your yt-dlp installation." << std::endl;
+        std::cerr << "--------------------------------------------------------------------" << std::endl;
+        return false;
+    }
+
+    bool looks_like_version = false;
+    if (!output.empty() && isdigit(output[0])) { // yt-dlp versions usually start with year e.g. 2023.xx.xx
+        if (output.find('.') != std::string::npos && output.length() > 5 && output.length() < 30) { // Basic sanity for version string
+            looks_like_version = true;
+        }
+    }
+
+    if (looks_like_version) {
+        std::cout << "yt-dlp version found: " << output << std::endl;
+        return true;
+    } else {
+         std::cout << "Warning: 'yt-dlp --version' returned an unexpected output: '" << output << "'" << std::endl;
+         std::cout << "Attempting to proceed, but yt-dlp might not be functioning correctly." << std::endl;
+         return true; // Proceed with caution
+    }
+}
+
 
 // Helper to generate a somewhat safe filename
 std::string sanitize_filename(const std::string& name) {
@@ -61,8 +142,8 @@ struct VideoFormat {
     std::string quality;
     std::string container;
     std::string codecs;
-    std::string type; // "video", "audio", "video_only", "audio_only"
-    std::string url; // Actual download URL (may need separate extraction)
+    std::string type;
+    std::string url;
 };
 
 // Basic structure to hold video metadata
@@ -72,393 +153,180 @@ struct VideoInfo {
     std::string author;
     long view_count;
     std::vector<VideoFormat> formats;
-    // Add more fields as needed, e.g., description, duration, thumbnails
 };
 
-// Function to extract Video ID from various YouTube URL formats
+// Function to extract Video ID from various YouTube URL formats (kept for potential future use, not critical for yt-dlp)
 std::string extract_video_id(const std::string& url) {
-    std::string video_id;
-    // Example: https://www.youtube.com/watch?v=VIDEO_ID
+    std::string video_id_extracted; // Renamed to avoid conflict
     size_t pos = url.find("watch?v=");
     if (pos != std::string::npos) {
-        video_id = url.substr(pos + 8);
-        pos = video_id.find('&'); // Remove extra parameters
+        video_id_extracted = url.substr(pos + 8);
+        pos = video_id_extracted.find('&');
         if (pos != std::string::npos) {
-            video_id = video_id.substr(0, pos);
+            video_id_extracted = video_id_extracted.substr(0, pos);
         }
-        return video_id;
+        return video_id_extracted;
     }
 
-    // Example: https://youtu.be/VIDEO_ID
     pos = url.find("youtu.be/");
     if (pos != std::string::npos) {
-        video_id = url.substr(pos + 9);
-        pos = video_id.find('?'); // Remove extra parameters
+        video_id_extracted = url.substr(pos + 9);
+        pos = video_id_extracted.find('?');
         if (pos != std::string::npos) {
-            video_id = video_id.substr(0, pos);
+            video_id_extracted = video_id_extracted.substr(0, pos);
         }
-        return video_id;
+        return video_id_extracted;
     }
-    // Add more patterns if needed (e.g., /embed/, /shorts/)
-    std::cerr << "Warning: Could not extract video ID from URL: " << url << std::endl;
-    return ""; // Return empty if no standard pattern matches
-}
-
-// Helper function to extract player.js URL from HTML
-std::string extract_player_url(const std::string& html_content) {
-    // Common regex based on yt-dlp's approach for /s/player/.../base.js
-    // This regex tries to find a path like "/s/player/xxxxxxxx/player_ias.vflset/en_US/base.js"
-    // It might need adjustments if YouTube changes its structure significantly.
-    std::regex player_regex(R"~("(?:PLAYER_JS_URL|jsUrl)"\s*:\s*"([^"]+\/base\.js)")~");
-    std::smatch match;
-
-    if (std::regex_search(html_content, match, player_regex) && match.size() > 1) {
-        std::string player_url = match[1].str();
-        // The extracted URL might be relative, e.g., /s/player/...
-        // Or it might be an absolute URL if the regex is adjusted or YouTube changes format.
-        // For now, assume it's a path that needs to be prepended with "https://www.youtube.com"
-        // if it doesn't start with "http".
-        if (player_url.rfind("http", 0) != 0) { // starts with "http" (covers http and https)
-             if (player_url.rfind("//", 0) == 0) { // starts with "//"
-                return "https:" + player_url;
-            } else if (player_url.rfind("/", 0) == 0) { // starts with "/"
-                return "https://www.youtube.com" + player_url;
-            }
-            // If it's not clearly relative or absolute in a known way, it might be problematic.
-            // However, yt-dlp patterns usually yield paths like /s/player/...
-        }
-        return player_url; // Already absolute or correctly prepended
-    } else {
-        // Fallback regex: Try to find any base.js URL, less specific
-        std::regex fallback_regex(R"~((/s/player/[a-zA-Z0-9\-_]+(?:/[a-zA-Z0-9\-_]+)?/base\.js))~");
-        if (std::regex_search(html_content, match, fallback_regex) && match.size() > 1) {
-            std::string player_url = match[1].str();
-             if (player_url.rfind("http", 0) != 0) {
-                if (player_url.rfind("//", 0) == 0) {
-                    return "https:" + player_url;
-                } else if (player_url.rfind("/", 0) == 0) {
-                    return "https://www.youtube.com" + player_url;
-                }
-            }
-            return player_url;
-        }
-    }
-    std::cerr << "Warning: Could not extract player_js_url from HTML." << std::endl;
-    return "";
-}
-
-// Helper function to fetch the content of the player script
-std::string fetch_player_script_content(const std::string& player_url) {
-    if (player_url.empty()) {
-        std::cerr << "Player URL is empty, cannot fetch script." << std::endl;
-        return "";
-    }
-    std::cout << "Fetching player script from: " << player_url << std::endl;
-    cpr::Response r = cpr::Get(cpr::Url{player_url},
-                               cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
-
-    if (r.status_code == 200) {
-        std::cout << "Successfully fetched player script. Length: " << r.text.length() << " bytes." << std::endl;
-        return r.text;
-    } else {
-        std::cerr << "Failed to fetch player script. Status code: " << r.status_code << std::endl;
-        if (!r.error.message.empty()) {
-            std::cerr << "CPR Error: " << r.error.message << std::endl;
-        }
-        return "";
-    }
+    // std::cerr << "Warning: Could not extract video ID from URL: " << url << ". Assuming input is ID." << std::endl;
+    return url;
 }
 
 
-// Function to fetch video info.
-// Tries keyless method (web page scraping) first.
-// API key is now optional and could be used for a fallback or specific features later.
-VideoInfo fetch_video_info(const std::string& video_id, const std::string& api_key = "") {
+// Function to fetch video info using yt-dlp
+VideoInfo fetch_video_info(const std::string& video_url_or_id, const std::string& api_key /*unused*/) {
     VideoInfo info;
-    info.id = video_id;
-    std::string player_script_url; // To store the extracted player URL
-    std::string player_script_content; // To store the fetched player script
-    bool scraping_successful = false;
+    info.id = video_url_or_id;
 
-    std::cout << "Attempting to fetch video info for ID: " << video_id << " using web scraping." << std::endl;
-
-    std::string watch_url = "https://www.youtube.com/watch?v=" + video_id;
-    cpr::Response r = cpr::Get(cpr::Url{watch_url},
-                               cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
-
-    if (r.status_code == 200) {
-        std::string html_content = r.text;
-        std::string json_str;
-
-        // Extract player script URL
-        player_script_url = extract_player_url(html_content);
-        if (!player_script_url.empty()) {
-            // std::cout << "Found player script URL: " << player_script_url << std::endl; // Already printed by extract_player_url
-            player_script_content = fetch_player_script_content(player_script_url);
-            if (player_script_content.empty()) {
-                std::cerr << "Failed to fetch player script content. Signature deciphering will likely fail." << std::endl;
+    std::string escaped_input = video_url_or_id;
+    // Basic escape for single quotes for shell safety if wrapped in single quotes
+    // This is a very naive way to escape for shell. A library or more robust method is preferred for general inputs.
+    // For YouTube IDs/URLs, it's usually fine.
+    {
+        std::string temp_escaped;
+        for(char c : escaped_input) {
+            if (c == '\'') {
+                temp_escaped += "'\\''"; // Replace ' with '\'', effectively breaking out and re-entering single quotes
             } else {
-                // Initialize the global decipherer with the fetched script content
-                // This should ideally only happen once per player script version.
-                // For simplicity, we call it here. A more advanced caching/management
-                // would be needed if dealing with multiple player versions concurrently.
-                ensure_decipherer_initialized(player_script_content);
-            }
-        } else {
-            // Player script URL not found, ensure_decipherer_initialized will not be called with content
-             ensure_decipherer_initialized(""); // Call with empty to indicate no script
-        }
-
-        // Try to find "var ytInitialPlayerResponse = {"
-        size_t start_pos = html_content.find("var ytInitialPlayerResponse = {");
-        if (start_pos == std::string::npos) {
-            // Try "ytInitialPlayerResponse = {" (common in some layouts)
-            start_pos = html_content.find("ytInitialPlayerResponse = {");
-            if (start_pos != std::string::npos) {
-                 start_pos += std::string("ytInitialPlayerResponse = ").length() -1; // Get to the '{'
-            }
-        } else {
-            start_pos += std::string("var ytInitialPlayerResponse = ").length() -1; // Get to the '{'
-        }
-
-        // Fallback: Try to find "ytInitialData = {"
-        if (start_pos == std::string::npos) {
-            start_pos = html_content.find("ytInitialData = {");
-             if (start_pos != std::string::npos) {
-                start_pos += std::string("ytInitialData = ").length() -1;
+                temp_escaped += c;
             }
         }
-
-
-        if (start_pos != std::string::npos) {
-            int brace_count = 0;
-            size_t end_pos = std::string::npos;
-            for (size_t i = start_pos; i < html_content.length(); ++i) {
-                if (html_content[i] == '{') {
-                    brace_count++;
-                } else if (html_content[i] == '}') {
-                    brace_count--;
-                    if (brace_count == 0) {
-                        end_pos = i;
-                        break;
-                    }
-                }
-            }
-
-            if (end_pos != std::string::npos) {
-                json_str = html_content.substr(start_pos, end_pos - start_pos + 1);
-                try {
-                    json player_response = json::parse(json_str);
-
-                    // --- Extracting data ---
-                    // Title and Author (from videoDetails in ytInitialPlayerResponse)
-                    if (player_response.contains("videoDetails")) {
-                        const auto& videoDetails = player_response["videoDetails"];
-                        if (videoDetails.contains("title") && videoDetails["title"].is_string()) {
-                            info.title = videoDetails["title"].get<std::string>();
-                        }
-                        if (videoDetails.contains("author") && videoDetails["author"].is_string()) {
-                            info.author = videoDetails["author"].get<std::string>();
-                        }
-                        if (videoDetails.contains("viewCount") && videoDetails["viewCount"].is_string()) {
-                           try {
-                                info.view_count = std::stol(videoDetails["viewCount"].get<std::string>());
-                           } catch (const std::exception& e) {
-                               std::cerr << "Warning: Could not parse view count: " << e.what() << std::endl;
-                               info.view_count = 0;
-                           }
-                        }
-                    }
-
-                    // Formats (from streamingData in ytInitialPlayerResponse)
-                    if (player_response.contains("streamingData")) {
-                        const auto& streamingData = player_response["streamingData"];
-
-                        auto process_format_list = [&](const json& format_list_json, bool is_adaptive) {
-                            if (!format_list_json.is_array()) return;
-
-                            for (const auto& fmt_json : format_list_json) {
-                                VideoFormat fmt;
-
-                                if (fmt_json.contains("itag") && fmt_json["itag"].is_number()) {
-                                    fmt.itag = std::to_string(fmt_json["itag"].get<int>());
-                                } else {
-                                    // itag is essential, skip if missing
-                                    std::cerr << "Warning: Skipping format entry without itag." << std::endl;
-                                    continue;
-                                }
-
-                                // Quality
-                                if (fmt_json.contains("qualityLabel") && fmt_json["qualityLabel"].is_string()) {
-                                    fmt.quality = fmt_json["qualityLabel"].get<std::string>();
-                                } else if (fmt_json.contains("quality") && fmt_json["quality"].is_string()) {
-                                    fmt.quality = fmt_json["quality"].get<std::string>(); // e.g. medium, small for non-adaptive
-                                } else if (fmt_json.contains("bitrate") && fmt_json["bitrate"].is_number()) { // Common for adaptive audio
-                                    fmt.quality = std::to_string(fmt_json["bitrate"].get<int>() / 1000) + "kbps";
-                                } else {
-                                    fmt.quality = "N/A";
-                                }
-
-                                // MimeType, Container, Codecs, Type
-                                if (fmt_json.contains("mimeType") && fmt_json["mimeType"].is_string()) {
-                                    std::string mime = fmt_json["mimeType"].get<std::string>();
-                                    size_t slash_pos = mime.find('/');
-                                    size_t semicolon_pos = mime.find(';');
-
-                                    if (slash_pos != std::string::npos) {
-                                        std::string main_type = mime.substr(0, slash_pos);
-                                        if (semicolon_pos != std::string::npos) {
-                                            fmt.container = mime.substr(slash_pos + 1, semicolon_pos - (slash_pos + 1));
-                                            std::string codecs_param = mime.substr(semicolon_pos + 1);
-                                            size_t codecs_val_pos = codecs_param.find("codecs=\"");
-                                            if (codecs_val_pos != std::string::npos) {
-                                                size_t start_quote = codecs_param.find('"', codecs_val_pos);
-                                                if (start_quote != std::string::npos) {
-                                                    size_t end_quote = codecs_param.find('"', start_quote + 1);
-                                                    if (end_quote != std::string::npos) {
-                                                        fmt.codecs = codecs_param.substr(start_quote + 1, end_quote - (start_quote + 1));
-                                                    } else {
-                                                         fmt.codecs = codecs_param.substr(start_quote + 1); // Best effort
-                                                    }
-                                                }
-                                            } else {
-                                                fmt.codecs = codecs_param; // Might just be the value
-                                            }
-                                        } else {
-                                            fmt.container = mime.substr(slash_pos + 1);
-                                        }
-
-                                        if (main_type == "audio") {
-                                            fmt.type = is_adaptive ? "audio_only" : "audio"; // "audio" for muxed, "audio_only" for adaptive
-                                        } else if (main_type == "video") {
-                                             fmt.type = is_adaptive ? "video_only" : "video"; // "video" for muxed, "video_only" for adaptive
-                                        } else {
-                                            fmt.type = "unknown";
-                                        }
-
-                                    } else { // Malformed mimeType
-                                        fmt.container = "unknown";
-                                        fmt.type = "unknown";
-                                    }
-                                } else { // MimeType missing
-                                    fmt.container = "N/A";
-                                    fmt.codecs = "N/A";
-                                    fmt.type = "N/A";
-                                }
-
-                                // URL or Cipher
-                                if (fmt_json.contains("url") && fmt_json["url"].is_string()) {
-                                    fmt.url = fmt_json["url"].get<std::string>();
-                                } else if ((fmt_json.contains("signatureCipher") && fmt_json["signatureCipher"].is_string()) ||
-                                           (fmt_json.contains("cipher") && fmt_json["cipher"].is_string()) ) {
-
-                                    std::string cipher_str = fmt_json.contains("signatureCipher") ?
-                                                             fmt_json["signatureCipher"].get<std::string>() :
-                                                             fmt_json["cipher"].get<std::string>();
-
-                                    std::cout << "Note: Format itag " << fmt.itag << " requires signature deciphering. Cipher: " << cipher_str.substr(0, 50) << "..." << std::endl;
-
-                                    if (global_decipherer) {
-                                        std::string base_url, encrypted_s, sig_param_name;
-                                        if (SignatureDecipherer::parse_signature_cipher(cipher_str, base_url, encrypted_s, sig_param_name)) {
-                                            std::cout << "  Parsed cipher: URL=" << base_url.substr(0,30) << "..., S=" << encrypted_s.substr(0,20) << "..., SP=" << sig_param_name << std::endl;
-                                            std::string deciphered_s = global_decipherer->decipher_signature(encrypted_s);
-
-                                            if (!deciphered_s.empty() && deciphered_s.find("PLACEHOLDER") == std::string::npos) {
-                                                // Construct the full URL
-                                                // Check if base_url already contains query params
-                                                if (base_url.find('?') == std::string::npos) {
-                                                    fmt.url = base_url + "?" + sig_param_name + "=" + deciphered_s;
-                                                } else {
-                                                    fmt.url = base_url + "&" + sig_param_name + "=" + deciphered_s;
-                                                }
-                                                std::cout << "  Successfully deciphered signature for itag " << fmt.itag << ". New URL (part): " << fmt.url.substr(0, 60) << "..." << std::endl;
-                                            } else {
-                                                std::cerr << "  Failed to decipher signature for itag " << fmt.itag << "." << std::endl;
-                                                if(deciphered_s.empty()){
-                                                    std::cerr << "   Decipher function returned empty string." << std::endl;
-                                                } else {
-                                                    std::cerr << "   Decipher function returned placeholder or error indicator: " << deciphered_s << std::endl;
-                                                }
-                                                fmt.url = "DECIPHER_FAILED"; // Mark as failed
-                                            }
-                                        } else {
-                                            std::cerr << "  Failed to parse signature cipher for itag " << fmt.itag << "." << std::endl;
-                                            fmt.url = "CIPHER_PARSE_FAILED";
-                                        }
-                                    } else {
-                                        std::cerr << "  Global decipherer not available for itag " << fmt.itag << "." << std::endl;
-                                        fmt.url = "NO_DECIPHERER";
-                                    }
-                                } else {
-                                    fmt.url = ""; // No URL and no cipher means it's likely unusable
-                                    std::cout << "Warning: Format itag " << fmt.itag << " has no URL or cipher." << std::endl;
-                                }
-
-                                info.formats.push_back(fmt);
-                            }
-                        };
-
-                        if (streamingData.contains("formats") && streamingData["formats"].is_array()) {
-                            process_format_list(streamingData["formats"], false); // Muxed streams
-                        }
-                        if (streamingData.contains("adaptiveFormats") && streamingData["adaptiveFormats"].is_array()) {
-                             process_format_list(streamingData["adaptiveFormats"], true); // Adaptive streams
-                        }
-                    }
-                    scraping_successful = true;
-                    std::cout << "Successfully parsed video info using web scraping." << std::endl;
-
-                } catch (const json::parse_error& e) {
-                    std::cerr << "JSON parsing error: " << e.what() << std::endl;
-                     // Print a snippet of the JSON string for debugging if it's not too long
-                    std::cerr << "Problematic JSON snippet (up to 500 chars): " << json_str.substr(0, std::min(json_str.length(), (size_t)500)) << std::endl;
-
-                }
-            } else {
-                std::cerr << "Could not find end of JSON blob." << std::endl;
-            }
-        } else {
-            std::cerr << "Could not find ytInitialPlayerResponse or ytInitialData in HTML content." << std::endl;
-        }
-    } else {
-        std::cerr << "Failed to fetch YouTube page. Status code: " << r.status_code << std::endl;
-        if (!r.error.message.empty()) {
-            std::cerr << "CPR Error: " << r.error.message << std::endl;
-        }
+        escaped_input = temp_escaped;
     }
 
-    if (scraping_successful) {
-        return info;
-    }
 
-    // Fallback to API key method if scraping fails AND an API key is provided
-    if (!api_key.empty()) {
-        std::cout << "Web scraping failed, but API key provided. Attempting API call (placeholder)..." << std::endl;
-        // **Actual API Implementation Would Be Here (as before)**
-        if (video_id == "dQw4w9WgXcQ") {
-            info.title = "Rick Astley - Never Gonna Give You Up (API Fallback)";
-            info.author = "RickAstleyVEVO (API Fallback)";
-            info.view_count = 1000000000;
-            info.formats.clear();
-            info.formats.push_back({"22", "720p (API)", "mp4", "avc1.64001F, mp4a.40.2", "video", "api_url_22"});
-            info.formats.push_back({"18", "360p (API)", "mp4", "avc1.42001E, mp4a.40.2", "video", "api_url_18"});
-        } else {
-            info.title = "Unknown Video (API Fallback)";
-            info.author = "Unknown Author (API Fallback)";
-            info.view_count = 0;
-            info.formats.clear();
+    std::string command = "yt-dlp -j --no-warnings --no-playlist '" + escaped_input + "'";
+    std::cout << "Fetching video info using yt-dlp (this might take a moment)..." << std::endl;
+
+    std::string json_output = execute_command_and_get_output(command);
+
+    if (json_output.empty() || json_output == "POPEN_FAILED" || json_output == "PIPE_READ_EXCEPTION") {
+        std::cerr << "Failed to execute yt-dlp or get output." << std::endl;
+        if (json_output != "POPEN_FAILED" && json_output != "PIPE_READ_EXCEPTION" && !json_output.empty()) {
+             std::cerr << "yt-dlp process output: " << json_output.substr(0, 500) << (json_output.length() > 500 ? "..." : "") << std::endl;
         }
         return info;
     }
 
-    std::cerr << "Failed to fetch video info. No successful method (scraping or API key)." << std::endl;
-    return info; // Return empty or partially filled info
+    if (json_output.find("ERROR:") != std::string::npos ||
+        json_output.find("Traceback (most recent call last):") != std::string::npos ||
+        (json_output.find("is not a valid URL") != std::string::npos && json_output.find(video_url_or_id) != std::string::npos) ||
+        json_output.find("Unsupported URL:") != std::string::npos) {
+        std::cerr << "yt-dlp reported an error processing the video/URL:" << std::endl;
+        std::cerr << json_output.substr(0, 1000) << (json_output.length() > 1000 ? "..." : "") << std::endl;
+        return info;
+    }
+
+    try {
+        json video_json = json::parse(json_output);
+
+        if (video_json.contains("id") && video_json["id"].is_string()) {
+            info.id = video_json["id"].get<std::string>();
+        }
+        if (video_json.contains("title") && video_json["title"].is_string()) {
+            info.title = video_json["title"].get<std::string>();
+        }
+        if (video_json.contains("uploader") && video_json["uploader"].is_string()) {
+            info.author = video_json["uploader"].get<std::string>();
+        } else if (video_json.contains("channel") && video_json["channel"].is_string()) {
+             info.author = video_json["channel"].get<std::string>();
+        }
+        if (video_json.contains("view_count") && video_json["view_count"].is_number()) {
+            info.view_count = video_json["view_count"].get<long>();
+        } else { info.view_count = 0; }
+
+
+        if (video_json.contains("formats") && video_json["formats"].is_array()) {
+            for (const auto& fmt_json : video_json["formats"]) {
+                VideoFormat fmt;
+                if (fmt_json.contains("format_id") && fmt_json["format_id"].is_string()) {
+                    fmt.itag = fmt_json["format_id"].get<std::string>();
+                } else { continue; }
+
+                if (fmt_json.contains("url") && fmt_json["url"].is_string()) {
+                    fmt.url = fmt_json["url"].get<std::string>();
+                } else {
+                    // std::cout << "Skipping format itag " << fmt.itag << " as it has no direct URL (likely a manifest)." << std::endl;
+                    continue;
+                }
+
+                if (fmt_json.contains("protocol") && fmt_json["protocol"].is_string()){
+                    std::string protocol = fmt_json["protocol"].get<std::string>();
+                    if (protocol.find("m3u8") != std::string::npos || protocol.find("dash") != std::string::npos) {
+                        // std::cout << "Skipping manifest format itag " << fmt.itag << " (protocol: " << protocol << ")" << std::endl;
+                        continue;
+                    }
+                }
+                if (fmt_json.contains("format") && fmt_json["format"].is_string() &&
+                    fmt_json["format"].get<std::string>().find("storyboard") != std::string::npos) {
+                    // std::cout << "Skipping storyboard format itag " << fmt.itag << std::endl;
+                    continue;
+                }
+
+                if (fmt_json.contains("format_note") && fmt_json["format_note"].is_string()) {
+                    fmt.quality = fmt_json["format_note"].get<std::string>();
+                } else if (fmt_json.contains("resolution") && fmt_json["resolution"].is_string()) {
+                     fmt.quality = fmt_json["resolution"].get<std::string>();
+                } else if (fmt_json.contains("height") && fmt_json["height"].is_number()) {
+                    fmt.quality = std::to_string(fmt_json["height"].get<int>()) + "p";
+                }
+
+                bool is_audio_only_from_vcodec = false;
+                if (fmt_json.contains("vcodec") && fmt_json["vcodec"].is_string() && fmt_json["vcodec"].get<std::string>() == "none") {
+                    is_audio_only_from_vcodec = true;
+                }
+
+                if (is_audio_only_from_vcodec && fmt_json.contains("abr") && fmt_json["abr"].is_number()) {
+                     if (!fmt.quality.empty() && fmt.quality != "N/A" && fmt.quality.find("p") != std::string::npos) {
+                     } else {
+                        if (!fmt.quality.empty() && fmt.quality != "N/A") fmt.quality += ", ";
+                        else fmt.quality.clear();
+                        fmt.quality += std::to_string(static_cast<int>(fmt_json["abr"].get<double>())) + "kbps";
+                     }
+                }
+                if (fmt.quality.empty()) fmt.quality = "N/A";
+
+                if (fmt_json.contains("ext") && fmt_json["ext"].is_string()) {
+                    fmt.container = fmt_json["ext"].get<std::string>();
+                } else { fmt.container = "N/A"; }
+
+                std::string vcodec = (fmt_json.contains("vcodec") && fmt_json["vcodec"].is_string()) ? fmt_json["vcodec"].get<std::string>() : "none";
+                std::string acodec = (fmt_json.contains("acodec") && fmt_json["acodec"].is_string()) ? fmt_json["acodec"].get<std::string>() : "none";
+                fmt.codecs = vcodec + " / " + acodec;
+
+                bool has_video = (vcodec != "none" && !vcodec.empty());
+                bool has_audio = (acodec != "none" && !acodec.empty());
+
+                if (has_video && has_audio) { fmt.type = "video/audio"; }
+                else if (has_video) { fmt.type = "video_only"; }
+                else if (has_audio) { fmt.type = "audio_only"; }
+                else { fmt.type = "unknown"; }
+
+                info.formats.push_back(fmt);
+            }
+        }
+        std::cout << "Successfully fetched and parsed video info using yt-dlp for: " << info.title << std::endl;
+
+    } catch (const json::parse_error& e) {
+        std::cerr << "Failed to parse JSON output from yt-dlp: " << e.what() << std::endl;
+        std::cerr << "yt-dlp output (first 1000 chars): " << json_output.substr(0, 1000) << (json_output.length() > 1000 ? "..." : "") << std::endl;
+        return info;
+    }
+    return info;
 }
 
 void display_video_info(const VideoInfo& info) {
-    if (info.title.empty() && info.id.empty()) {
-        std::cout << "No video information to display." << std::endl;
+    if (info.title.empty() && info.id.empty()) { // Check if ID is also empty (or still original input if title is empty)
+        std::cout << "No video information to display (yt-dlp might have failed or video not found)." << std::endl;
         return;
     }
     std::cout << "\n--- Video Information ---" << std::endl;
@@ -472,10 +340,11 @@ void display_video_info(const VideoInfo& info) {
         for (const auto& fmt : info.formats) {
             std::cout << "Itag: " << fmt.itag << ", Type: " << fmt.type
                       << ", Quality: " << fmt.quality << ", Container: " << fmt.container
-                      << ", Codecs: " << fmt.codecs << std::endl;
+                      << ", Codecs: " << fmt.codecs
+                      << std::endl;
         }
     } else {
-        std::cout << "No format information available (or not implemented yet)." << std::endl;
+        std::cout << "No format information available (or yt-dlp found no suitable formats)." << std::endl;
     }
     std::cout << "-------------------------" << std::endl;
 }
@@ -486,26 +355,9 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
         std::cerr << "Error: Download URL for itag " << format_to_download.itag << " is empty." << std::endl;
         return false;
     }
-    if (format_to_download.url == "NEEDS_DECIPHERING" ||
-        format_to_download.url == "NEEDS_DECIPHERING_OLD" ||
-        format_to_download.url == "NO_DECIPHERER" ||
-        format_to_download.url == "DECIPHER_FAILED" ||
-        format_to_download.url == "CIPHER_PARSE_FAILED") {
-        std::cerr << "Error: Cannot download itag " << format_to_download.itag
-                  << ". Reason: URL is '" << format_to_download.url << "'." << std::endl;
-        std::cerr << "       This typically means signature deciphering failed or was not possible." << std::endl;
-        return false;
-    }
-    if (format_to_download.url.rfind("api_url_", 0) == 0) { // Check if URL starts with "api_url_"
-        std::cerr << "Error: Download URL for itag " << format_to_download.itag
-                  << " is a placeholder API URL. API download not fully implemented." << std::endl;
-        return false;
-    }
 
-    // Construct a filename. e.g., "VideoTitle_itag.container"
     std::string base_filename = sanitize_filename(video_info.title.empty() ? video_info.id : video_info.title);
     std::string filename_extension = format_to_download.container;
-    // Basic sanitation for extension to avoid issues like "mp4; codecs=..."
     size_t semicolon_pos = filename_extension.find(';');
     if (semicolon_pos != std::string::npos) {
         filename_extension = filename_extension.substr(0, semicolon_pos);
@@ -514,24 +366,21 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
 
     std::cout << "Attempting to download format " << format_to_download.itag
               << " for video '" << video_info.title << "'"
-              << " from URL: " << format_to_download.url
+              << " from URL: " << format_to_download.url.substr(0, 70) << (format_to_download.url.length() > 70 ? "..." : "")
               << " to " << filename << std::endl;
 
-    // Ensure output directory exists using C++17 filesystem
     try {
-        if (!output_dir.empty() && output_dir != ".") { // Avoid creating "." if it's the current dir
+        if (!output_dir.empty() && output_dir != ".") {
             std::filesystem::path dir_path(output_dir);
             if (!std::filesystem::exists(dir_path)) {
                 std::cout << "Creating output directory: " << output_dir << std::endl;
                 if (!std::filesystem::create_directories(dir_path)) {
                     std::cerr << "Error: Could not create output directory: " << output_dir << std::endl;
-                    // Optionally, one might decide to return false here if dir creation is critical
                 }
             }
         }
     } catch (const std::filesystem::filesystem_error& e) {
         std::cerr << "Filesystem error while checking/creating output directory: " << e.what() << std::endl;
-        // Optionally, return false
     }
 
     std::ofstream outfile(filename, std::ios::binary);
@@ -540,8 +389,6 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
         return false;
     }
 
-    // Make HTTP GET request using cpr for downloading
-    // Use a User-Agent, as some servers might block requests without one.
     cpr::Response r = cpr::Download(outfile, cpr::Url{format_to_download.url},
                                   cpr::Header{{"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}});
 
@@ -558,13 +405,11 @@ bool download_video_format(const VideoInfo& video_info, const VideoFormat& forma
         if (!r.status_line.empty()){
             std::cerr << "  Status line: " << r.status_line << std::endl;
         }
-        if(!r.text.empty() && r.text.length() < 500) { // Print small error bodies
+        if(!r.text.empty() && r.text.length() < 500) {
             std::cerr << "  Response body: " << r.text << std::endl;
         }
-        // Potentially delete partially downloaded file
-        outfile.close(); // Close before attempting to remove
+        outfile.close();
         if (std::remove(filename.c_str()) != 0) {
-            // std::perror(("Error deleting partial file " + filename).c_str()); // More detailed error
         } else {
             std::cout << "Partially downloaded file " << filename << " removed." << std::endl;
         }
@@ -578,21 +423,30 @@ void print_usage(const char* prog_name) {
               << "Options:\n"
               << "  -h, --help          Show this help message\n"
               << "  -f, --format <itag> Specify video format itag for download\n"
-              << "  --api-key <key>     Your YouTube API Key (optional, for fallback or specific features)\n"
-              << "  -o, --output <dir>  Output directory for downloads (defaults to current dir)\n";
+              << "  -o, --output <dir>  Output directory for downloads (defaults to current dir)\n"
+              << "Requires yt-dlp to be installed and in PATH.\n";
 }
 
 int main(int argc, char **argv) {
+    std::cout << PROJECT_NAME << " - YouTube CLI Downloader" << std::endl;
+    std::cout << "-------------------------------------------" << std::endl;
+    std::cout << "This tool relies on 'yt-dlp' being installed and accessible in your system's PATH." << std::endl;
+
+    if (!check_ytdlp_availability()) {
+        return 1; // Exit if yt-dlp is not available
+    }
+    std::cout << "-------------------------------------------" << std::endl;
+
+
     std::vector<std::string> args(argv + 1, argv + argc);
 
-    if (args.empty()) {
+    if (args.empty() || (args.size() == 1 && (args[0] == "-h" || args[0] == "--help"))) {
         print_usage(argv[0]);
-        return 1;
+        return args.empty() ? 1 : 0;
     }
 
-    std::string video_url_or_id;
+    std::string video_url_or_id_arg;
     std::string selected_format_itag;
-    std::string api_key;
     std::string output_directory = ".";
 
     for (size_t i = 0; i < args.size(); ++i) {
@@ -607,14 +461,6 @@ int main(int argc, char **argv) {
                 print_usage(argv[0]);
                 return 1;
             }
-        } else if (args[i] == "--api-key") {
-            if (i + 1 < args.size()) {
-                api_key = args[++i];
-            } else {
-                std::cerr << "Error: " << args[i] << " option requires an argument (API key)." << std::endl;
-                print_usage(argv[0]);
-                return 1;
-            }
         } else if (args[i] == "-o" || args[i] == "--output") {
             if (i + 1 < args.size()) {
                 output_directory = args[++i];
@@ -624,8 +470,8 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-         else if (video_url_or_id.empty()) {
-            video_url_or_id = args[i];
+         else if (video_url_or_id_arg.empty()) {
+            video_url_or_id_arg = args[i];
         } else {
             std::cerr << "Error: Unknown argument or too many URLs/IDs: " << args[i] << std::endl;
             print_usage(argv[0]);
@@ -633,45 +479,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (video_url_or_id.empty()) {
+    if (video_url_or_id_arg.empty()) {
         std::cerr << "Error: Video URL or ID is required." << std::endl;
         print_usage(argv[0]);
         return 1;
     }
 
-    // API key is now optional. If not provided by arg, check env.
-    // If still not found, it remains empty, and fetch_video_info will primarily try scraping.
-    if (api_key.empty()) {
-        const char* env_api_key = std::getenv("YOUTUBE_API_KEY");
-        if (env_api_key != nullptr) {
-            api_key = env_api_key;
-            std::cout << "Using optional API key from YOUTUBE_API_KEY environment variable." << std::endl;
-        }
-    }
-    if (!api_key.empty()) {
-        std::cout << "Optional API key provided. It may be used if web scraping fails or for specific features." << std::endl;
-    } else {
-        std::cout << "No API key provided. Relying primarily on web scraping." << std::endl;
-    }
-
-    std::cout << "Project Name: " << PROJECT_NAME << std::endl;
-
-    std::string video_id = extract_video_id(video_url_or_id);
-    if (video_id.empty() && !video_url_or_id.empty()) {
-        std::cout << "Could not extract video ID from input, assuming input is already a video ID: " << video_url_or_id << std::endl;
-        video_id = video_url_or_id;
-    }
-
-    if (video_id.empty()) {
-        std::cerr << "Error: Could not determine video ID." << std::endl;
-        return 1;
-    }
-
-    std::cout << "Processing video ID: " << video_id << std::endl;
-
-    VideoInfo video_info = fetch_video_info(video_id, api_key);
-    if (video_info.title.empty() && video_info.id != video_id) { // Check if fetch_video_info returned empty/error
-        std::cerr << "Failed to fetch video info. Exiting." << std::endl;
+    VideoInfo video_info = fetch_video_info(video_url_or_id_arg, "");
+    if (video_info.title.empty() && (video_info.id == video_url_or_id_arg || video_info.id.empty()) ) {
+        std::cerr << "Failed to fetch video info. Check if yt-dlp is installed and working, and if the video URL/ID is correct." << std::endl;
         return 1;
     }
     display_video_info(video_info);

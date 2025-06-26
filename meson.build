@@ -1,41 +1,32 @@
-project('yt-cli-downloader', 'cpp',
-  version : '0.1',
-  default_options : ['warning_level=3', 'cpp_std=c++17'])
+project('yt-cli-downloader', 'cpp', # Assuming no other C files, 'c' can be removed
+        version : '0.1.0',
+        default_options : ['cpp_std=c++17', 'warning_level=2'])
 
-# --- Subproject Dependencies ---
+# --- Dependencies ---
+# CPR (cpr::cpr)
+cpr_dep = dependency('cpr', version : '>=1.9', required : true)
 
-# nlohmann/json (header-only, fetched via wrap file)
-# The subproject 'nlohmann_json' (directory name from .wrap) should have a meson.build
-# that defines the variable 'nlohmann_json_dep' (from [provide] section of .wrap).
-json_sub = subproject('nlohmann_json')
-json_dep = json_sub.get_variable('nlohmann_json_dep')
+# nlohmann_json (nlohmann_json::nlohmann_json)
+nlohmann_json_dep = dependency('nlohmann_json', version : '>=3.10', required : true)
 
-# CPR (C++ Requests, fetched via wrap file)
-# The subproject 'cpr' (directory name from .wrap) should have a meson.build
-# that defines the variable 'cpr_dep' (from [provide] section of .wrap).
-# CPR's meson build should also handle its own dependency on libcurl.
-# We can pass options to subprojects if needed, for example, to encourage system curl usage
-# or disable tests for faster configuration.
-cpr_sub = subproject('cpr',
-  default_options : [
-    'CPR_BUILD_TESTS=disabled', # Don't build CPR's own tests
-    'CPR_GENERATE_COVERAGE=false', # Disable coverage for CPR
-    'CPR_USE_SYSTEM_CURL=true' # This can be an option if CPR's meson.build supports it explicitly
-                               # and you want to ensure it doesn't try to build its own curl.
-                               # Usually, CPR's meson will try `dependency('curl')` which is good.
-  ]
-)
-cpr_dep = cpr_sub.get_variable('cpr_dep')
+# --- Include Directories ---
+# Only 'src' is needed now if yt_sig_decipher.hpp was in src
+inc_dirs = include_directories('src')
 
+# --- Source Files ---
+executable_sources = [
+    'src/yt_cli_downloader.cpp'
+    # Removed: 'src/yt_sig_decipher.cpp'
+    # Removed: 'vendor/duktape/duktape.c'
+]
 
-cpp_args = []
-link_args = []
-deps = [json_dep, cpr_dep]
-
-
+# --- Executable Definition ---
 executable('yt-cli-downloader',
-           'yt_cli_downloader.cpp',
-           dependencies : deps,
-           cpp_args : cpp_args,
-           link_args : link_args,
+           executable_sources,
+           include_directories : inc_dirs,
+           dependencies : [cpr_dep, nlohmann_json_dep],
+           cpp_args : ['-pthread'], # For CPR, if it requires pthreads
            install : true)
+
+# Any previous sections related to building Duktape as a separate library
+# or a duktape_dep should also be removed.
