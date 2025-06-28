@@ -58,7 +58,7 @@ std::string execute_command_and_get_output(const std::string& command) {
 
     std::string command_with_stderr = command + " 2>&1";
 
-    FILE* pipe = _popen(command_with_stderr.c_str(), "r");
+    FILE* pipe = popen(command_with_stderr.c_str(), "r");
     if (!pipe) {
         std::cerr << "popen() failed for command: " << command << std::endl;
         return "POPEN_FAILED";
@@ -68,12 +68,12 @@ std::string execute_command_and_get_output(const std::string& command) {
             result += buffer.data();
         }
     } catch (...) {
-        _pclose(pipe);
+        pclose(pipe);
         std::cerr << "Exception while reading pipe for command: " << command << std::endl;
         return "PIPE_READ_EXCEPTION";
     }
 
-    int status = _pclose(pipe);
+    int status = pclose(pipe);
     if (status == -1) {
         std::cerr << "pclose() failed for command: " << command << std::endl;
     } else {
