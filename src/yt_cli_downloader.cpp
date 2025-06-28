@@ -58,7 +58,7 @@ std::string execute_command_and_get_output(const std::string& command) {
 
     std::string command_with_stderr = command + " 2>&1";
 
-    FILE* pipe = _popen(command_with_stderr.c_str(), "r");
+    FILE* pipe = popen(command_with_stderr.c_str(), "r");
     if (!pipe) {
         std::cerr << "popen() failed for command: " << command << std::endl;
         return "POPEN_FAILED";
@@ -68,12 +68,12 @@ std::string execute_command_and_get_output(const std::string& command) {
             result += buffer.data();
         }
     } catch (...) {
-        _pclose(pipe);
+        pclose(pipe);
         std::cerr << "Exception while reading pipe for command: " << command << std::endl;
         return "PIPE_READ_EXCEPTION";
     }
 
-    int status = _pclose(pipe);
+    int status = pclose(pipe);
     if (status == -1) {
         std::cerr << "pclose() failed for command: " << command << std::endl;
     } else {
@@ -671,6 +671,98 @@ bool check_ffmpeg_availability() {
         return false;
     }
 }
+
+
+// Function to download video and audio streams and merge them with ffmpeg
+bool download_and_merge_streams(const VideoInfo& video_info, const VideoFormat& video_format, const VideoFormat& audio_format, const std::string& output_dir = ".", const std::string& final_filename_no_ext = "") {
+    if (!check_ffmpeg_availability()) {
+        std::cerr << "ffmpeg is required for merging streams but it's not available or not working." << std::endl;
+        return false;
+    }
+
+    std::string video_filepath, audio_filepath;
+    bool video_download_success = false;
+    bool audio_download_success = false;
+
+    std::cout << "\nDownloading video stream (itag " << video_format.itag << ")..." << std::endl;
+    video_download_success = download_stream(video_info, video_format, "video_temp", output_dir, &video_filepath);
+
+    if (!video_download_success) {
+        std::cerr << "Failed to download video stream. Aborting merge." << std::endl;
+        if (!video_filepath.empty()) std::remove(video_filepath.c_str()); // Clean up partial video file
+        return false;
+    }
+
+    std::cout << "\nDownloading audio stream (itag " << audio_format.itag << ")..." << std::endl;
+    audio_download_success = download_stream(video_info, audio_format, "audio_temp", output_dir, &audio_filepath);
+
+    if (!audio_download_success) {
+        std::cerr << "Failed to download audio stream. Aborting merge." << std::endl;
+        if (!audio_filepath.empty()) std::remove(audio_filepath.c_str()); // Clean up partial audio file
+        if (!video_filepath.empty()) std::remove(video_filepath.c_str()); // Clean up downloaded video file
+        return false;
+    }
+
+    std::string sanitized_title = sanitize_filename(video_info.title.empty() ? video_info.id : video_info.title);
+    std::string output_filename_base = final_filename_no_ext.empty() ? sanitized_title : sanitize_filename(final_filename_no_ext);
+
+    // Determine a sensible output container, MKV is a good default.
+    // Could also try to match video_format.container if it's mp4 and audio is compatible.
+    std::string output_container = "mkv";
+    // A more sophisticated approach might check codecs:
+    // if (video_format.container == "mp4" && (audio_format.codecs.find("aac") != std::string::npos || audio_format.codecs.find("mp4a") != std::string::npos) ) {
+    //    output_container = "mp4";
+    // }
+
+    std::string merged_filepath = output_dir + "/" + output_filename_base + "." + output_container;
+
+    std::cout << "\nMerging video and audio streams using ffmpeg..." << std::endl;
+    std::cout << "Video input: " << video_filepath << std::endl;
+    std::cout << "Audio input: " << audio_filepath << std::endl;
+    std::cout << "Output file: " << merged_filepath << std::endl;
+
+    // Using -hide_banner for less verbose output, -loglevel error to only show critical errors.
+    // Using \" for paths to handle spaces, though sanitize_filename should prevent most issues.
+    std::string ffmpeg_command = "ffmpeg -hide_banner -loglevel error -y -i \"" + video_filepath + "\" -i \"" + audio_filepath + "\" -c copy \"" + merged_filepath + "\"";
+
+    std::cout << "Executing ffmpeg command: " << ffmpeg_command << std::endl;
+    std::string ffmpeg_output = execute_command_and_get_output(ffmpeg_command);
+
+    bool merge_success = false;
+    // Check if merged file exists and is not empty
+    std::ifstream merged_file(merged_filepath, std::ios::binary | std::ios::ate);
+    if (merged_file.good() && merged_file.tellg() > 0) {
+        merge_success = true;
+        std::cout << "Successfully merged streams to: " << merged_filepath << std::endl;
+        std::cout << "Final size: " << format_bytes(merged_file.tellg()) << std::endl;
+    } else {
+        std::cerr << "ffmpeg merge failed or produced an empty file." << std::endl;
+        if (!ffmpeg_output.empty() && ffmpeg_output != "POPEN_FAILED" && ffmpeg_output != "PIPE_READ_EXCEPTION") {
+            std::cerr << "ffmpeg output:" << std::endl << ffmpeg_output << std::endl;
+        }
+         // Try to remove potentially corrupted merged file
+        if (merged_file.is_open()) merged_file.close(); // Close before trying to remove
+        std::remove(merged_filepath.c_str());
+    }
+    merged_file.close();
+
+    // Clean up temporary files
+    std::cout << "Cleaning up temporary files..." << std::endl;
+    if (!video_filepath.empty() && std::remove(video_filepath.c_str()) == 0) {
+        std::cout << "Removed temporary video file: " << video_filepath << std::endl;
+    } else if (!video_filepath.empty()){
+        std::cerr << "Warning: Failed to remove temporary video file: " << video_filepath << std::endl;
+    }
+    if (!audio_filepath.empty() && std::remove(audio_filepath.c_str()) == 0) {
+        std::cout << "Removed temporary audio file: " << audio_filepath << std::endl;
+    } else if (!audio_filepath.empty()){
+        std::cerr << "Warning: Failed to remove temporary audio file: " << audio_filepath << std::endl;
+    }
+
+    return merge_success;
+}
+
+
 // Function for downloading a single video/audio format stream
 // Renamed from download_video_format to download_stream.
 // `given_filename_suffix` is used to make temp file names like "title_video.mp4" or "title_audio.m4a" for merging.
@@ -848,103 +940,18 @@ bool download_stream(const VideoInfo& video_info, const VideoFormat& format_to_d
 }
 
 
-// Function to download video and audio streams and merge them with ffmpeg
-bool download_and_merge_streams(const VideoInfo& video_info, const VideoFormat& video_format, const VideoFormat& audio_format, const std::string& output_dir = ".", const std::string& final_filename_no_ext = "") {
-    if (!check_ffmpeg_availability()) {
-        std::cerr << "ffmpeg is required for merging streams but it's not available or not working." << std::endl;
-        return false;
-    }
-
-    std::string video_filepath, audio_filepath;
-    bool video_download_success = false;
-    bool audio_download_success = false;
-
-    std::cout << "\nDownloading video stream (itag " << video_format.itag << ")..." << std::endl;
-    video_download_success = download_stream(video_info, video_format, "video_temp", output_dir, &video_filepath);
-
-    if (!video_download_success) {
-        std::cerr << "Failed to download video stream. Aborting merge." << std::endl;
-        if (!video_filepath.empty()) std::remove(video_filepath.c_str()); // Clean up partial video file
-        return false;
-    }
-
-    std::cout << "\nDownloading audio stream (itag " << audio_format.itag << ")..." << std::endl;
-    audio_download_success = download_stream(video_info, audio_format, "audio_temp", output_dir, &audio_filepath);
-
-    if (!audio_download_success) {
-        std::cerr << "Failed to download audio stream. Aborting merge." << std::endl;
-        if (!audio_filepath.empty()) std::remove(audio_filepath.c_str()); // Clean up partial audio file
-        if (!video_filepath.empty()) std::remove(video_filepath.c_str()); // Clean up downloaded video file
-        return false;
-    }
-
-    std::string sanitized_title = sanitize_filename(video_info.title.empty() ? video_info.id : video_info.title);
-    std::string output_filename_base = final_filename_no_ext.empty() ? sanitized_title : sanitize_filename(final_filename_no_ext);
-
-    // Determine a sensible output container, MKV is a good default.
-    // Could also try to match video_format.container if it's mp4 and audio is compatible.
-    std::string output_container = "mkv";
-    // A more sophisticated approach might check codecs:
-    // if (video_format.container == "mp4" && (audio_format.codecs.find("aac") != std::string::npos || audio_format.codecs.find("mp4a") != std::string::npos) ) {
-    //    output_container = "mp4";
-    // }
-
-    std::string merged_filepath = output_dir + "/" + output_filename_base + "." + output_container;
-
-    std::cout << "\nMerging video and audio streams using ffmpeg..." << std::endl;
-    std::cout << "Video input: " << video_filepath << std::endl;
-    std::cout << "Audio input: " << audio_filepath << std::endl;
-    std::cout << "Output file: " << merged_filepath << std::endl;
-
-    // Using -hide_banner for less verbose output, -loglevel error to only show critical errors.
-    // Using \" for paths to handle spaces, though sanitize_filename should prevent most issues.
-    std::string ffmpeg_command = "ffmpeg -hide_banner -loglevel error -y -i \"" + video_filepath + "\" -i \"" + audio_filepath + "\" -c copy \"" + merged_filepath + "\"";
-
-    std::cout << "Executing ffmpeg command: " << ffmpeg_command << std::endl;
-    std::string ffmpeg_output = execute_command_and_get_output(ffmpeg_command);
-
-    bool merge_success = false;
-    // Check if merged file exists and is not empty
-    std::ifstream merged_file(merged_filepath, std::ios::binary | std::ios::ate);
-    if (merged_file.good() && merged_file.tellg() > 0) {
-        merge_success = true;
-        std::cout << "Successfully merged streams to: " << merged_filepath << std::endl;
-        std::cout << "Final size: " << format_bytes(merged_file.tellg()) << std::endl;
-    } else {
-        std::cerr << "ffmpeg merge failed or produced an empty file." << std::endl;
-        if (!ffmpeg_output.empty() && ffmpeg_output != "POPEN_FAILED" && ffmpeg_output != "PIPE_READ_EXCEPTION") {
-            std::cerr << "ffmpeg output:" << std::endl << ffmpeg_output << std::endl;
-        }
-         // Try to remove potentially corrupted merged file
-        if (merged_file.is_open()) merged_file.close(); // Close before trying to remove
-        std::remove(merged_filepath.c_str());
-    }
-    merged_file.close();
-
-    // Clean up temporary files
-    std::cout << "Cleaning up temporary files..." << std::endl;
-    if (!video_filepath.empty() && std::remove(video_filepath.c_str()) == 0) {
-        std::cout << "Removed temporary video file: " << video_filepath << std::endl;
-    } else if (!video_filepath.empty()){
-        std::cerr << "Warning: Failed to remove temporary video file: " << video_filepath << std::endl;
-    }
-    if (!audio_filepath.empty() && std::remove(audio_filepath.c_str()) == 0) {
-        std::cout << "Removed temporary audio file: " << audio_filepath << std::endl;
-    } else if (!audio_filepath.empty()){
-        std::cerr << "Warning: Failed to remove temporary audio file: " << audio_filepath << std::endl;
-    }
-
-    return merge_success;
-}
-
-
 void print_usage(const char* prog_name) {
     std::cerr << "Usage: " << prog_name << " <video_url_or_id> [options]\n"
               << "Options:\n"
-              << "  -h, --help          Show this help message\n"
-              << "  -f, --format <itag> Specify video format itag for download\n"
-              << "  -o, --output <dir>  Output directory for downloads (defaults to current dir)\n"
-              << "Requires yt-dlp to be installed and in PATH.\n";
+              << "  -h, --help                Show this help message\n"
+              << "  -l, --list-formats        List available formats for the video\n"
+              << "  -f, --format <format_str> Specify video/audio format string for download.\n"
+              << "                            Examples: 'best', '137+140' (video_itag+audio_itag),\n"
+              << "                            '18' (single pre-muxed itag), 'bestvideo', 'bestaudio'.\n"
+              << "                            Default is 'best' (merged best quality).\n"
+              << "  -o, --output <path>       Output directory or full filename template (e.g., \"./downloads/My Video.mkv\").\n"
+              << "                            Defaults to current directory with video title as filename.\n"
+              << "Requires yt-dlp and ffmpeg (for merging) to be installed and in PATH.\n";
 }
 
 int main(int argc, char **argv) {
@@ -967,15 +974,21 @@ int main(int argc, char **argv) {
     }
 
     std::string video_url_or_id_arg;
-    std::string format_selection_str; // Can be "best", "itag", "itagV+itagA", "bestvideo+bestaudio" etc.
+    std::string format_selection_str;
     std::string output_directory = ".";
-    std::string output_filename_template; // For -o "filename.mp4" type usage, not just dir
+    std::string output_filename_template;
+    bool list_formats_flag = false;
 
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "-h" || args[i] == "--help") {
             print_usage(argv[0]);
             return 0;
-        } else if (args[i] == "-f" || args[i] == "--format") {
+        } else if (args[i] == "-l" || args[i] == "--list-formats") {
+            list_formats_flag = true;
+            // No need to break here, other arguments might be parsed for validity,
+            // but list_formats_flag will take precedence later.
+        }
+        else if (args[i] == "-f" || args[i] == "--format") {
             if (i + 1 < args.size()) {
                 format_selection_str = args[++i];
             } else {
@@ -1032,6 +1045,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     display_video_info(video_info);
+
+    // If -l or --list-formats was used, display info (already done) and exit.
+    if (list_formats_flag) {
+        std::cout << "\nListing formats as requested. To download, omit -l and optionally use -f." << std::endl;
+        return 0;
+    }
 
     if (format_selection_str.empty()){
         std::cout << "\nNo format specified with -f. Defaulting to 'best' (best video + best audio merged)." << std::endl;
